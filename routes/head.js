@@ -23,14 +23,19 @@ initializeDatabase1();
 const generateSecurityKey = () => Math.random().toString(36).substring(2, 10).toUpperCase();
 
 
-// Professional OTP Email (same design for all users)
-const sendProfessionalOTPEmail = async (email, otp, userType = "User") => {
+const pendingPasswordResets = new Map();
+
+// Updated sendProfessionalOTPEmail to support Password Reset emails
+const sendProfessionalOTPEmail = async (email, otp, userType = "User", purpose = "registration") => {
+  const action = purpose === "password_reset" ? "password reset" : "registration";
+  const subjectAction = purpose === "password_reset" ? "Password Reset" : "Registration";
+
   const html = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #e0e0e0; border-radius: 12px; background: #f9f9f9;">
       <h2 style="color: #1a73e8; text-align: center;">CogniCode Project Management</h2>
-      <h3 style="color: #333; text-align: center;">Your Registration OTP</h3>
+      <h3 style="color: #333; text-align: center;">Your ${subjectAction} OTP</h3>
       <p style="font-size: 16px; color: #555;">Hello,</p>
-      <p style="font-size: 16px; color: #555;">Your one-time password for ${userType} registration is:</p>
+      <p style="font-size: 16px; color: #555;">Your one-time password for ${userType} ${action} is:</p>
       <div style="text-align: center; margin: 30px 0;">
         <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1a73e8; background: #fff; padding: 15px 30px; border-radius: 8px; border: 2px solid #1a73e8;">${otp}</span>
       </div>
@@ -44,7 +49,7 @@ const sendProfessionalOTPEmail = async (email, otp, userType = "User") => {
   await transporter.sendMail({
     from: process.env.SENDER_EMAIL,
     to: email,
-    subject: `Your ${userType} Registration OTP - CogniCode`,
+    subject: `Your ${userType} ${subjectAction} OTP - CogniCode`,
     html
   });
 };
@@ -427,6 +432,93 @@ router.get("/fetch_head_data", function (req, res) {
       });
     }
   });
+});
+
+router.post('/request_password_reset', async function (req, res) {
+  const { email, role } = req.body;
+
+  if (!email || !role) {
+    return res.status(400).json({ status: false, message: "Email and role are required." });
+  }
+
+  try {
+    const query = `
+      SELECT "headId", "headMail" 
+      FROM "Entities".head 
+      WHERE "headMail" = $1
+    `;
+    const result = await pgPool.query(query, [email]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: false, message: "No account found with this email." });
+    }
+
+    const pending = pendingPasswordResets.get(email);
+    if (pending && Date.now() - pending.timestamp < 60000) {
+      return res.status(429).json({ status: false, message: "Please wait 1 minute before requesting again." });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    pendingPasswordResets.set(email, {
+      otp,
+      timestamp: Date.now(),
+      role: "Head",
+      verified: false
+    });
+
+    await sendProfessionalOTPEmail(email, otp, `Head Password Reset`, "password_reset");
+
+    return res.status(200).json({
+      status: true,
+      message: "OTP sent to your email.",
+      sentTo: email
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ status: false, message: "Server error." });
+  }
+});
+
+router.post('/verify_reset_otp', async function (req, res) {
+  const { email, otp, role } = req.body;
+  const pending = pendingPasswordResets.get(email);
+
+  if (!pending || pending.otp !== otp || Date.now() - pending.timestamp > 600000) {
+    return res.status(400).json({ status: false, message: "Invalid or expired OTP." });
+  }
+
+  pending.verified = true;
+  pendingPasswordResets.set(email, pending);
+
+  return res.status(200).json({ status: true, message: "OTP verified successfully." });
+});
+
+router.post('/reset_password', async function (req, res) {
+  const { email, newPassword, role } = req.body;
+  const pending = pendingPasswordResets.get(email);
+
+  if (!pending || !pending.verified) {
+    return res.status(400).json({ status: false, message: "Session expired. Please restart forgot password process." });
+  }
+
+  try {
+    // NOTE: Storing as plain text to stay compatible with existing Head login system
+    const result = await pgPool.query(
+      `UPDATE "Entities".head SET password = $1 WHERE ("headMail" = $2 OR "headName" = $2)`,
+      [newPassword, email]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ status: false, message: "Head not found." });
+    }
+
+    pendingPasswordResets.delete(email);
+
+    return res.status(200).json({ status: true, message: "Password reset successfully!" });
+  } catch (e) {
+    console.error("Head Reset Password Error:", e);
+    return res.status(500).json({ status: false, message: "Failed to reset password." });
+  }
 });
 
 module.exports = router;

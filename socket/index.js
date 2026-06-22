@@ -367,7 +367,7 @@ socket.on("sendTLMessage", async (data) => {
 });
 
 socket.on("sendTLToMonitorMessage", async (data) => {
-  const { projectId, type, msgData, timestamp, senderId, tempId, replyTo } = data;
+  const { projectId, type, msgData, timestamp, senderId, tempId, replyTo, senderName } = data;
   try {
     const projectIdNum = Number(projectId);
     if (isNaN(projectIdNum)) return;
@@ -390,7 +390,7 @@ socket.on("sendTLToMonitorMessage", async (data) => {
       'SELECT "employeeName" as senderName, "employeePic" as senderPic FROM "Entities".employees WHERE "employeeId" = $1',
       [senderIdNum]
     );
-    const senderName = senderResult.rows[0]?.senderName || "Team Leader";
+    // const senderName = senderResult.rows[0]?.senderName || "Team Leader";
     const senderPic  = senderResult.rows[0]?.senderPic || "";
 
     // Check if row exists, create if not
@@ -458,7 +458,8 @@ socket.on("sendTLToMonitorMessage", async (data) => {
 
 // ====================== NEW: UNIFIED EMPLOYEE CHAT (No Monitor Logic) ======================
 socket.on("sendEmployeeMessage", async (data) => {
-  const { projectId, type, msgData, timestamp, senderId, tempId, replyTo } = data;
+  const { projectId, type, msgData, timestamp, senderId, tempId, replyTo, senderName } = data;
+  console.log(`🔔 sendEmployeeMessage received: projectId=${projectId}, senderId=${senderId}, type=${type}, senderName=${senderName}`);
 
   try {
     const projectIdNum = Number(projectId);
@@ -491,7 +492,7 @@ socket.on("sendEmployeeMessage", async (data) => {
       'SELECT "employeeName" as senderName, "employeePic" as senderPic FROM "Entities".employees WHERE "employeeId" = $1',
       [senderIdNum]
     );
-    const senderName = senderResult.rows[0]?.senderName || "Employee";
+    // const senderName = senderResult.rows[0]?.senderName || "Employee";
     const senderPic  = senderResult.rows[0]?.senderPic || "";
 
     const chatJson = JSON.stringify({ 

@@ -22,14 +22,19 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// ==================== PROFESSIONAL OTP EMAIL (Used by all users) ====================
-const sendProfessionalOTPEmail = async (email, otp, userType = "User") => {
+// In-memory store for pending registrations (unchanged)
+const pendingEmployees = new Map();
+
+const sendProfessionalOTPEmail = async (email, otp, userType = "User", purpose = "registration") => {
+  const action = purpose === "password_reset" ? "password reset" : "registration";
+  const subjectAction = purpose === "password_reset" ? "Password Reset" : "Registration";
+
   const html = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 30px; border: 1px solid #e0e0e0; border-radius: 12px; background: #f9f9f9;">
       <h2 style="color: #1a73e8; text-align: center;">CogniCode Project Management</h2>
-      <h3 style="color: #333; text-align: center;">Your Registration OTP</h3>
+      <h3 style="color: #333; text-align: center;">Your ${subjectAction} OTP</h3>
       <p style="font-size: 16px; color: #555;">Hello,</p>
-      <p style="font-size: 16px; color: #555;">Your one-time password for ${userType} registration is:</p>
+      <p style="font-size: 16px; color: #555;">Your one-time password for ${userType} ${action} is:</p>
       <div style="text-align: center; margin: 30px 0;">
         <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1a73e8; background: #fff; padding: 15px 30px; border-radius: 8px; border: 2px solid #1a73e8;">${otp}</span>
       </div>
@@ -43,13 +48,10 @@ const sendProfessionalOTPEmail = async (email, otp, userType = "User") => {
   await transporter.sendMail({
     from: process.env.SENDER_EMAIL,
     to: email,
-    subject: `Your ${userType} Registration OTP - CogniCode`,
+    subject: `Your ${userType} ${subjectAction} OTP - CogniCode`,
     html
   });
 };
-
-// In-memory store for pending registrations (unchanged)
-const pendingEmployees = new Map();
 
 // Register Employee or Team Leader - Fully Updated with Resend OTP
 router.post('/register_employee', upload.single("employeePic"), async function (req, res) {
@@ -904,6 +906,86 @@ router.post('/send_project_activation_email', verifyToken, async function (req, 
   } catch (err) {
     console.error("Activation Email Error:", err);
     return res.status(500).json({ status: false, message: "Failed to send activation email" });
+  }
+});
+
+
+// ==================== SIMPLIFIED FORGOT PASSWORD ====================
+router.post('/request_password_reset', async function (req, res) {
+  const { email, role } = req.body;
+
+  if (!email || !role) {
+    return res.status(400).json({ status: false, message: "Email and role are required." });
+  }
+
+  try {
+    // Search only by email (safe & simple)
+    const query = `
+      SELECT "employeeId", "employeeMail", role 
+      FROM "Entities".employees 
+      WHERE "employeeMail" = $1 AND role = $2
+    `;
+    const result = await pgPool.query(query, [email, role]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: false, message: "No account found with this email." });
+    }
+
+    // Rate limit
+    const pending = pendingPasswordResets.get(email);
+    if (pending && Date.now() - pending.timestamp < 60000) {
+      return res.status(429).json({ status: false, message: "Please wait 1 minute before requesting again." });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    pendingPasswordResets.set(email, {
+      otp,
+      timestamp: Date.now(),
+      role,
+      verified: false
+    });
+
+    await sendProfessionalOTPEmail(email, otp, `${role} Password Reset`, "password_reset");
+
+    return res.status(200).json({
+      status: true,
+      message: "OTP sent to your email.",
+      sentTo: email
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ status: false, message: "Server error." });
+  }
+});
+
+router.post('/verify_reset_otp', async function (req, res) {
+  const { email, otp, role } = req.body;
+  const pending = pendingPasswordResets.get(email);
+  if (!pending || pending.role !== role || pending.otp !== otp || Date.now() - pending.timestamp > 600000) {
+    return res.status(400).json({ status: false, message: "Invalid or expired OTP." });
+  }
+  pending.verified = true;
+  pendingPasswordResets.set(email, pending);
+  return res.status(200).json({ status: true, message: "OTP verified." });
+});
+
+router.post('/reset_password', async function (req, res) {
+  const { email, newPassword, role } = req.body;
+  const pending = pendingPasswordResets.get(email);
+  if (!pending || !pending.verified || pending.role !== role) {
+    return res.status(400).json({ status: false, message: "Session expired. Please restart forgot password." });
+  }
+  try {
+    const hashed = await bcrypt.hash(newPassword, 10);
+    const result = await pgPool.query(
+      `UPDATE "Entities".employees SET password = $1 WHERE ("employeeMail" = $2 OR "employeeName" = $2) AND role = $3`,
+      [hashed, email, role]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ status: false, message: "User not found." });
+    pendingPasswordResets.delete(email);
+    return res.status(200).json({ status: true, message: "Password reset successfully!" });
+  } catch (e) {
+    return res.status(500).json({ status: false, message: "Failed to reset password." });
   }
 });
 
