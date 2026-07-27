@@ -131,7 +131,8 @@ const initializeDatabase2 = async () => {
   "teamleaderid" INTEGER,
   "tlchats" TEXT[] DEFAULT ARRAY[]::TEXT[],
   "tlaudios" TEXT[] DEFAULT ARRAY[]::TEXT[],
-  "status" VARCHAR(50) DEFAULT 'Hold' NOT NULL
+  "status" VARCHAR(50) DEFAULT 'Hold' NOT NULL,
+  "active_date" TIMESTAMP DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS projectschema."progressTracking" (

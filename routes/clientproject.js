@@ -21,6 +21,81 @@ const transporter = nodemailer.createTransport({
   }
 });
 
+// ==================== NEW: Send Client Activation Confirmation Email ====================
+const sendClientActivationConfirmation = async (clientMail, clientName, projectTitle, workstream, projectId) => {
+  if (!clientMail || !clientMail.includes('@')) return;
+
+  const dashboardUrl = process.env.FRONTEND_URL || 'https://ccitpms.com/';
+
+  const msg = {
+    from: process.env.SMTP_USER,
+    to: clientMail,
+    subject: `🎉 Your Project is Now Active – ${projectTitle} | CogniCode`,
+    html: `
+      <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 620px; margin: auto; padding: 24px; background: #f8fafc; border-radius: 12px; border: 1px solid #e2e8f0;">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <div style="display: inline-block; background: linear-gradient(135deg, #10b981, #059669); color: white; padding: 12px 24px; border-radius: 9999px; font-weight: 700; font-size: 15px;">
+            ✅ PROJECT ACTIVATED
+          </div>
+        </div>
+
+        <h2 style="color: #0f172a; text-align: center; margin: 0 0 8px 0; font-size: 26px;">Great news, ${clientName || 'Client'}!</h2>
+        <p style="color: #334155; text-align: center; font-size: 16px; margin: 0 0 28px 0;">
+          Your project has been successfully activated by our Sales Team.
+        </p>
+
+        <div style="background: white; border-radius: 10px; padding: 20px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); margin-bottom: 24px;">
+          <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+              <td style="padding: 10px 0; color: #64748b; font-weight: 600; width: 140px;">Project Title</td>
+              <td style="padding: 10px 0; color: #0f172a; font-weight: 700;">${projectTitle}</td>
+            </tr>
+            <tr>
+              <td style="padding: 10px 0; color: #64748b; font-weight: 600;">Workstream</td>
+              <td style="padding: 10px 0; color: #0f172a;">${workstream || 'N/A'}</td>
+            </tr>
+            <tr>
+              <td style="padding: 10px 0; color: #64748b; font-weight: 600;">Project ID</td>
+              <td style="padding: 10px 0; color: #0f172a; font-family: monospace;">#${projectId}</td>
+            </tr>
+            <tr>
+              <td style="padding: 10px 0; color: #64748b; font-weight: 600;">Status</td>
+              <td style="padding: 10px 0;">
+                <span style="background: #dcfce7; color: #166534; padding: 4px 14px; border-radius: 9999px; font-size: 13px; font-weight: 700;">ACTIVE</span>
+              </td>
+            </tr>
+          </table>
+        </div>
+
+        <p style="color: #475569; font-size: 15px; line-height: 1.6;">
+          Our team will now begin working on your project. You can track progress, communicate with the team, and view updates directly from your dashboard.
+        </p>
+
+        <div style="text-align: center; margin: 32px 0 16px;">
+          <a href="${dashboardUrl}" 
+             style="background: #1e40af; color: white; padding: 14px 36px; text-decoration: none; border-radius: 8px; font-weight: 700; display: inline-block; box-shadow: 0 10px 15px -3px rgb(30 64 175 / 0.3);">
+            Open My Dashboard →
+          </a>
+        </div>
+
+        <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+
+        <p style="color: #64748b; font-size: 12px; text-align: center; margin: 0;">
+          This is an automated confirmation from <strong>CogniCode Project Management</strong><br>
+          If you have any questions, reply to this email or contact your assigned Team Leader.
+        </p>
+      </div>
+    `
+  };
+
+  try {
+    await transporter.sendMail(msg);
+    console.log(`✅ Client activation confirmation sent to: ${clientMail}`);
+  } catch (err) {
+    console.error(`❌ Failed to send client activation email:`, err);
+  }
+};
+
 initializeDatabase2(); // Your existing call (now creates project schema)
 let io;
 
@@ -1299,6 +1374,7 @@ router.get("/show_all_clientsprojects", function (req, res) {
         cp.tlchats,
         cp.tlaudios,
         cp.status,
+        cp.active_date,
         c."clientName",
         c."clientPic"
       FROM projectschema.clientproject cp
@@ -1334,31 +1410,50 @@ router.post("/update_project_status/:projectId", async (req, res) => {
   }
 
   try {
-    const result = await pgPool.query(
-      'UPDATE projectschema.clientproject SET status = $1 WHERE project_id = $2 RETURNING status',
-      [status, projectId]
-    );
+    let query = `UPDATE projectschema.clientproject SET status = $1`;
+    let values = [status, projectId];
+
+    if (status === 'Active') {
+      const activationMsg = JSON.stringify({
+        type: 'system',
+        data: `✅ Project activated on ${new Date().toLocaleDateString('en-GB')}`,
+        timestamp: new Date().toISOString(),
+        seen_by: []
+      });
+
+      query += `, active_date = NOW(), clientchats = array_append(COALESCE(clientchats, ARRAY[]::text[]), $3)`;
+      values = [status, projectId, activationMsg];
+    }
+
+    query += ` WHERE project_id = $2 RETURNING status, active_date`;
+
+    const result = await pgPool.query(query, values);
 
     if (result.rowCount === 0) {
       return res.status(404).json({ status: false, message: "Project not found." });
     }
 
-    // Optional: Emit socket event for real-time update if needed
-if (io) {
-      io.to("employees").emit("projectStatusUpdated", {
-        project_id: projectId,
-        status: status,
-        project: { project_id: projectId, status: status }
-      });
-    }
-   
+    if (io) {
+  // For Employees / Team Leaders
+  io.to("employees").emit("projectStatusUpdated", {
+    projectId: projectId,
+    status: status
+  });
+
+  // For Client + Head + anyone who joined the project room
+  io.to(`project_${projectId}`).emit("projectStatusUpdated", {
+    projectId: projectId,
+    status: status
+  });
+}
+
     return res.status(200).json({
       status: true,
       message: "Project status updated successfully!",
       data: result.rows[0]
     });
   } catch (err) {
-    console.error("Server Error:", err);
+    console.error("Server Error in update_project_status:", err);
     return res.status(500).json({ status: false, message: "Server Error...!" });
   }
 });
@@ -1872,6 +1967,58 @@ const chatJson = JSON.stringify({
   } catch (e) {
     console.error("Server Error:", e);
     return res.status(500).json({ status: false, message: `Server Error: ${e.message}` });
+  }
+});
+
+// ==================== REMOVE EMPLOYEE FROM PROJECT ====================
+router.post("/remove_employee_from_project", async (req, res) => {
+  const { project_id, employeeId } = req.body;
+
+  if (!project_id || !employeeId) {
+    return res.status(400).json({ status: false, message: "project_id and employeeId are required" });
+  }
+
+  const projectIdNum = Number(project_id);
+  const employeeIdNum = Number(employeeId);
+
+  if (isNaN(projectIdNum) || isNaN(employeeIdNum)) {
+    return res.status(400).json({ status: false, message: "Invalid project_id or employeeId" });
+  }
+
+  try {
+    // Delete the request row → this automatically disables chat
+    const result = await pgPool.query(
+      `DELETE FROM projectschema."employeeRequests"
+       WHERE project_id = $1 AND employeeid = $2
+       RETURNING request_id`,
+      [projectIdNum, employeeIdNum]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ status: false, message: "Employee is not assigned to this project" });
+    }
+
+    // Real-time notify the employee so their chat disables immediately
+    if (io) {
+      io.to(`employee_${employeeIdNum}`).emit("employeeRemovedFromProject", {
+        projectId: projectIdNum,
+        employeeId: employeeIdNum,
+      });
+
+      // Also notify the TL room (optional)
+      io.to("tl").emit("employeeRemovedFromProject", {
+        projectId: projectIdNum,
+        employeeId: employeeIdNum,
+      });
+    }
+
+    return res.status(200).json({
+      status: true,
+      message: "Employee removed from project successfully",
+    });
+  } catch (err) {
+    console.error("remove_employee_from_project error:", err);
+    return res.status(500).json({ status: false, message: err.message });
   }
 });
 

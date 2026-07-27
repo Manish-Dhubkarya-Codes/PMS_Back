@@ -837,17 +837,33 @@ router.post('/verify_employee_role', verifyToken,async function (req, res) {
   }
 });
 
-// ==================== OFFICIAL PROJECT ACTIVATION EMAIL (Exact match to /save_project style) ====================
-router.post('/send_project_activation_email', verifyToken, async function (req, res) {
+router.post('/send_project_activation_email', async function (req, res) {
   const { projectId, projectTitle, workstream } = req.body;
 
   try {
-    // Get Head email
-    const headResult = await pgPool.query(`
-      SELECT "headMail" FROM "Entities".head LIMIT 1
-    `);
+    // Get client details
+    const clientRes = await pgPool.query(`
+      SELECT c."clientMail", c."clientName"
+      FROM projectschema.clientproject cp
+      JOIN "Entities".clients c ON cp.clientid = c."clientId"
+      WHERE cp.project_id = $1
+    `, [projectId]);
 
-    // Get all Technical Team Leaders
+    const client = clientRes.rows[0];
+
+    // Send confirmation email to CLIENT
+    if (client) {
+      await sendClientActivationConfirmation(
+        client.clientMail,
+        client.clientName,
+        projectTitle,
+        workstream,
+        projectId
+      );
+    }
+
+    // Send to internal team (Head + Technical TLs)
+    const headResult = await pgPool.query(`SELECT "headMail" FROM "Entities".head LIMIT 1`);
     const tlResult = await pgPool.query(`
       SELECT "employeeMail" 
       FROM "Entities".employees 
@@ -859,50 +875,40 @@ router.post('/send_project_activation_email', verifyToken, async function (req, 
     if (headResult.rows[0]?.headMail) recipients.push(headResult.rows[0].headMail);
     tlResult.rows.forEach(r => recipients.push(r.employeeMail));
 
-    if (recipients.length === 0) {
-      return res.json({ status: true, message: "No recipients found" });
+    if (recipients.length > 0) {
+      const dashboardUrl = process.env.FRONTEND_URL || 'http://187.77.184.39:5173/';
+
+      const mailOptions = {
+        from: process.env.SENDER_EMAIL,
+        to: recipients,
+        subject: `🚀 Project Activated: ${projectTitle} - CogniCode Project Management`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 620px; margin:auto; padding:20px; border:1px solid #e0e0e0; border-radius:8px; background:#fafafa;">
+            <h2 style="color: #34a853; text-align:center;">Project is Now Active ✅</h2>
+            <p>Hello Team,</p>
+            <p>The Sales Team has activated the following project:</p>
+            <table style="width:100%; border-collapse:collapse; margin:20px 0; background:white; border-radius:6px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+              <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Title</td><td style="padding:12px;">${projectTitle}</td></tr>
+              <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Workstream</td><td style="padding:12px;">${workstream || 'N/A'}</td></tr>
+              <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Project ID</td><td style="padding:12px;">#${projectId}</td></tr>
+            </table>
+            <p style="text-align:center;">
+              <a href="${dashboardUrl}" style="background:#1a73e8; color:white; padding:12px 28px; text-decoration:none; border-radius:6px; font-weight:bold; display:inline-block;">
+                Go to Dashboard
+              </a>
+            </p>
+            <hr style="border:0; border-top:1px solid #eee; margin:30px 0;">
+            <p style="color:#777; font-size:12px; text-align:center;">
+              Automated message – <strong>CogniCode Project Management</strong>
+            </p>
+          </div>
+        `
+      };
+
+      await transporter.sendMail(mailOptions);
     }
 
-    const dashboardUrl = `${process.env.FRONTEND_URL || 'http://187.77.184.39:5173/'}`;
-
-    const mailOptions = {
-      from: process.env.SENDER_EMAIL,
-      to: recipients,
-      subject: `🚀 Project Activated: ${projectTitle} - CogniCode Project Management`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 620px; margin:auto; padding:20px; border:1px solid #e0e0e0; border-radius:8px; background:#fafafa;">
-          
-          <h2 style="color: #34a853; text-align:center;">Project is Now Active ✅</h2>
-          
-          <p>Hello Team,</p>
-          <p>The Sales Team has activated the following project:</p>
-          
-          <table style="width:100%; border-collapse:collapse; margin:20px 0; background:white; border-radius:6px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
-            <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Title</td><td style="padding:12px;">${projectTitle}</td></tr>
-            <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Workstream</td><td style="padding:12px;">${workstream || 'N/A'}</td></tr>
-            <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Project ID</td><td style="padding:12px;">#${projectId}</td></tr>
-          </table>
-          
-          <p style="text-align:center;">
-            <a href="${dashboardUrl}"
-               style="background:#1a73e8; color:white; padding:12px 28px; text-decoration:none; border-radius:6px; font-weight:bold; display:inline-block;">
-              Go to Dashboard
-            </a>
-          </p>
-          
-          <hr style="border:0; border-top:1px solid #eee; margin:30px 0;">
-          
-          <p style="color:#777; font-size:12px; text-align:center;">
-            Automated message – <strong>CogniCode Project Management</strong>
-          </p>
-        </div>
-      `
-    };
-
-    await transporter.sendMail(mailOptions);
-    console.log(`✅ Official activation email sent to ${recipients.length} recipients`);
-
-    return res.json({ status: true, message: "Activation email sent successfully" });
+    return res.json({ status: true, message: "Activation email sent to client + team successfully" });
   } catch (err) {
     console.error("Activation Email Error:", err);
     return res.status(500).json({ status: false, message: "Failed to send activation email" });

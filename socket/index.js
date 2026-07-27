@@ -29,9 +29,14 @@ module.exports = (io) => {
   console.log(`User ${socket.id} joined TL room`);
 });
 
-socket.on("joinEmployeeRoom", () => {
+socket.on("joinEmployeeRoom", (employeeId) => {
   socket.join("employees");
-  console.log(`✅ Employee ${socket.id} joined global "employees" room for live project updates`);
+
+  if (employeeId) {
+    const personalRoom = `employee_${employeeId}`;
+    socket.join(personalRoom);
+    console.log(`✅ Employee joined personal room: ${personalRoom}`);
+  }
 });
 
     // Fixed: Join TL Monitor room event name (standardized to camelCase)
@@ -781,64 +786,260 @@ socket.on('sendMessage', async (data) => {
       }
     });
 
+    // ==================== TL-MONITOR MESSAGE EDIT ====================
+socket.on("editTLMonitorMessage", async (data) => {
+  const { projectId, index, newData, timestamp, fromTL } = data;
+  const projectIdNum = Number(projectId);
+  if (isNaN(projectIdNum) || !timestamp || !newData) return;
+
+  try {
+    const field = fromTL ? "TLChats" : "MonitorChats";
+
+    const result = await pgPool.query(
+      `SELECT "${field}" FROM projectschema."projectTLClientChats" WHERE "projectId" = $1`,
+      [projectIdNum]
+    );
+    if (result.rows.length === 0) return;
+
+    const messages = result.rows[0][field] || [];
+    let foundIndex = -1;
+
+    // Prefer timestamp
+    const targetTime = new Date(timestamp).getTime();
+    for (let i = 0; i < messages.length; i++) {
+      try {
+        const m = JSON.parse(messages[i]);
+        if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) {
+          foundIndex = i;
+          break;
+        }
+      } catch {}
+    }
+
+    // Fallback to index
+    if (foundIndex === -1 && typeof index === "number" && index >= 0 && index < messages.length) {
+      foundIndex = index;
+    }
+
+    if (foundIndex === -1) {
+      console.log("❌ editTLMonitorMessage: message NOT FOUND", { index, timestamp, fromTL });
+      return;
+    }
+
+    let msgObj = JSON.parse(messages[foundIndex]);
+
+    // 2-minute rule
+    if (Date.now() - new Date(msgObj.timestamp).getTime() > 2 * 60 * 1000) {
+      console.log("⏱️ editTLMonitorMessage blocked – time exceeded");
+      return;
+    }
+
+    if (msgObj.type !== "text") return;
+
+    msgObj.data = newData;
+    msgObj.edited = true;
+    msgObj.editedAt = new Date().toISOString();
+
+    messages[foundIndex] = JSON.stringify(msgObj);
+
+    await pgPool.query(
+      `UPDATE projectschema."projectTLClientChats" SET "${field}" = $1 WHERE "projectId" = $2`,
+      [messages, projectIdNum]
+    );
+
+    io.to(`tl_monitor_${projectId}`).emit("tlMonitorMessageEdited", {
+      projectId,
+      index: foundIndex,
+      newData: msgObj.data,
+      editedAt: msgObj.editedAt,
+      timestamp: msgObj.timestamp,
+      fromTL,
+    });
+  } catch (e) {
+    console.error("editTLMonitorMessage error:", e);
+  }
+});
+
+// ==================== TL-MONITOR MESSAGE DELETE ====================
+socket.on("deleteTLMonitorMessage", async (data) => {
+  const { projectId, index, timestamp, fromTL } = data;
+  const projectIdNum = Number(projectId);
+  if (isNaN(projectIdNum) || !timestamp) return;
+
+  try {
+    // Try both chat and audio arrays
+    const fieldsToTry = fromTL 
+      ? ["TLChats", "TLAudios"] 
+      : ["MonitorChats", "MonitorAudios"];
+
+    let found = false;
+    let finalField = "";
+    let finalMessages = [];
+    let foundIndex = -1;
+    let msgObj = null;
+
+    for (const field of fieldsToTry) {
+      const result = await pgPool.query(
+        `SELECT "${field}" FROM projectschema."projectTLClientChats" WHERE "projectId" = $1`,
+        [projectIdNum]
+      );
+      if (result.rows.length === 0) continue;
+
+      const messages = result.rows[0][field] || [];
+      const targetTime = new Date(timestamp).getTime();
+
+      for (let i = 0; i < messages.length; i++) {
+        try {
+          const m = JSON.parse(messages[i]);
+          if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) {
+            foundIndex = i;
+            msgObj = m;
+            finalField = field;
+            finalMessages = messages;
+            found = true;
+            break;
+          }
+        } catch {}
+      }
+      if (found) break;
+
+      // Fallback to index
+      if (typeof index === "number" && index >= 0 && index < messages.length) {
+        foundIndex = index;
+        msgObj = JSON.parse(messages[index]);
+        finalField = field;
+        finalMessages = messages;
+        found = true;
+        break;
+      }
+    }
+
+    if (!found || !msgObj) {
+      console.log("❌ deleteTLMonitorMessage: message NOT FOUND", { index, timestamp, fromTL });
+      return;
+    }
+
+    // 2-minute rule
+    if (Date.now() - new Date(msgObj.timestamp).getTime() > 2 * 60 * 1000) {
+      console.log("⏱️ deleteTLMonitorMessage blocked – time exceeded");
+      return;
+    }
+
+    msgObj.isDeleted = true;
+    msgObj.deletedAt = new Date().toISOString();
+    msgObj.data = null;
+    msgObj.caption = null;
+
+    finalMessages[foundIndex] = JSON.stringify(msgObj);
+
+    await pgPool.query(
+      `UPDATE projectschema."projectTLClientChats" SET "${finalField}" = $1 WHERE "projectId" = $2`,
+      [finalMessages, projectIdNum]
+    );
+
+    io.to(`tl_monitor_${projectId}`).emit("tlMonitorMessageDeleted", {
+      projectId,
+      index: foundIndex,
+      timestamp: msgObj.timestamp,
+      deletedAt: msgObj.deletedAt,
+      fromTL,
+    });
+  } catch (e) {
+    console.error("deleteTLMonitorMessage error:", e);
+  }
+});
+
+// ==================== CORRECT editClientMessage ====================
 socket.on("editClientMessage", async (data) => {
   const { projectId, index, newText, timestamp } = data;
-  const projectIdNum = Number(projectId);
-  if (isNaN(projectIdNum) || index === undefined || index === null) return;
+
+  if (!projectId || (index === undefined && !timestamp) || !newText) {
+    console.log("❌ editClientMessage: missing data");
+    return;
+  }
+
+  const projectIdNum = parseInt(projectId);
 
   try {
     const result = await pgPool.query(
       `SELECT clientchats FROM projectschema.clientproject WHERE project_id = $1`,
       [projectIdNum]
     );
+
     if (result.rows.length === 0) return;
 
-    const messages = result.rows[0].clientchats || [];
-    if (index >= messages.length) return;
+    let messages = result.rows[0].clientchats || [];
+    let foundIndex = -1;
 
-    let msgObj;
-    try {
-      msgObj = JSON.parse(messages[index]);
-    } catch (e) {
-      console.error("Edit: JSON parse error at index", index, e);
+    // === Hybrid lookup (same as working delete) ===
+    if (timestamp) {
+      const targetTime = new Date(timestamp).getTime();
+      for (let i = 0; i < messages.length; i++) {
+        try {
+          const m = JSON.parse(messages[i]);
+          if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) {
+            foundIndex = i;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    if (foundIndex === -1 && index !== undefined) {
+      foundIndex = index;
+    }
+
+    if (foundIndex === -1 || foundIndex >= messages.length) {
+      console.log("❌ editClientMessage: message NOT FOUND", { index, timestamp });
       return;
     }
 
-    // ✅ FIX: was msgObj.message — DB stores text in `data` field
+    let msgObj;
+    try {
+      msgObj = JSON.parse(messages[foundIndex]);
+    } catch (e) {
+      console.error("JSON parse error in editClientMessage", e);
+      return;
+    }
+
+    // 2-minute rule check
+    if (Date.now() - new Date(msgObj.timestamp).getTime() > 2 * 60 * 1000) {
+      console.log("⏱️ editClientMessage blocked – time exceeded");
+      return;
+    }
+
+    // === Update the message ===
     msgObj.data = newText;
     msgObj.edited = true;
-    msgObj.editedAt = timestamp;
+    msgObj.editedAt = new Date().toISOString();
 
-    messages[index] = JSON.stringify(msgObj);
+    messages[foundIndex] = JSON.stringify(msgObj);
 
     await pgPool.query(
       `UPDATE projectschema.clientproject SET clientchats = $1 WHERE project_id = $2`,
       [messages, projectIdNum]
     );
 
+    console.log("✅ editClientMessage success", { foundIndex, timestamp: msgObj.timestamp });
+
+    // === Emit with consistent payload (same style as delete) ===
     io.to(`project_${projectId}`).emit("clientMessageEdited", {
       projectId,
-      index,
-      updatedMsg: {
-        timestamp: msgObj.timestamp,
-        data: msgObj.data,
-        edited: true,
-        editedAt: msgObj.editedAt,
-        seen_by: msgObj.seen_by,
-        type: msgObj.type,
-        replyTo: msgObj.replyTo || null,
-        mention: msgObj.mention || null,
-      },
+      index: foundIndex,
+      newData: msgObj.data,
+      editedAt: msgObj.editedAt,
+      timestamp: msgObj.timestamp,
     });
+
   } catch (e) {
     console.error("editClientMessage error:", e);
   }
 });
 
 socket.on("deleteClientMessage", async (data) => {
-  const { projectId, index, timestamp } = data;
+  const { projectId, index, timestamp } = data; // timestamp = original msg timestamp
   const projectIdNum = Number(projectId);
-  if (isNaN(projectIdNum) || index === undefined || index === null) return;
+  if (isNaN(projectIdNum)) return;
 
   try {
     const result = await pgPool.query(
@@ -849,31 +1050,67 @@ socket.on("deleteClientMessage", async (data) => {
 
     let field = "clientchats";
     let messages = result.rows[0].clientchats || [];
+    let foundIndex = -1;
 
-    if (index >= messages.length) {
+    // 1. Prefer original timestamp
+    if (timestamp) {
+      const targetTime = new Date(timestamp).getTime();
+      for (let i = 0; i < messages.length; i++) {
+        try {
+          const m = JSON.parse(messages[i]);
+          if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) {
+            foundIndex = i;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    // 2. Fallback to index
+    if (foundIndex === -1 && typeof index === "number" && index >= 0 && index < messages.length) {
+      foundIndex = index;
+    }
+
+    // 3. Try audios
+    if (foundIndex === -1) {
       field = "clientaudios";
       messages = result.rows[0].clientaudios || [];
+      if (timestamp) {
+        const targetTime = new Date(timestamp).getTime();
+        for (let i = 0; i < messages.length; i++) {
+          try {
+            const m = JSON.parse(messages[i]);
+            if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) {
+              foundIndex = i;
+              break;
+            }
+          } catch {}
+        }
+      }
+      if (foundIndex === -1 && typeof index === "number" && index >= 0 && index < messages.length) {
+        foundIndex = index;
+      }
     }
 
-    if (index >= messages.length) {
-      console.error("deleteClientMessage: index out of bounds", index);
+    if (foundIndex === -1) {
+      console.log("❌ deleteClientMessage: message NOT FOUND", { index, timestamp });
       return;
     }
 
-    let msgObj;
-    try {
-      msgObj = JSON.parse(messages[index]);
-    } catch (e) {
-      console.error("Delete: JSON parse error at index", index, e);
+    let msgObj = JSON.parse(messages[foundIndex]);
+
+    // 2-minute rule
+    if (Date.now() - new Date(msgObj.timestamp).getTime() > 2 * 60 * 1000) {
+      console.log("⏱️ deleteClientMessage blocked – time exceeded");
       return;
     }
 
-    // ✅ FIX: was msgObj.message/msgObj.file — DB field is `data`
     msgObj.isDeleted = true;
-    msgObj.deletedAt = timestamp;
+    msgObj.deletedAt = new Date().toISOString();
     msgObj.data = null;
+    msgObj.caption = null;
 
-    messages[index] = JSON.stringify(msgObj);
+    messages[foundIndex] = JSON.stringify(msgObj);
 
     await pgPool.query(
       `UPDATE projectschema.clientproject SET ${field} = $1 WHERE project_id = $2`,
@@ -882,14 +1119,9 @@ socket.on("deleteClientMessage", async (data) => {
 
     io.to(`project_${projectId}`).emit("clientMessageDeleted", {
       projectId,
-      index,
-      updatedMsg: {
-        timestamp: msgObj.timestamp,
-        isDeleted: true,
-        deletedAt: msgObj.deletedAt,
-        type: msgObj.type,
-        seen_by: msgObj.seen_by,
-      },
+      index: foundIndex,
+      timestamp: msgObj.timestamp,
+      deletedAt: msgObj.deletedAt,
     });
   } catch (e) {
     console.error("deleteClientMessage error:", e);
@@ -898,128 +1130,302 @@ socket.on("deleteClientMessage", async (data) => {
 
 
     // ─── TL MESSAGE EDIT / DELETE ─────────────────────────────────────────────
-    socket.on("editTLMessage", async (data) => {
-      const { projectId, index, newData, editedAt } = data;
-      const projectIdNum = Number(projectId);
-      if (isNaN(projectIdNum) || index === undefined || index === null) return;
-      try {
-        const result = await pgPool.query(
-          `SELECT tlchats FROM projectschema.clientproject WHERE project_id = $1`,
-          [projectIdNum]
-        );
-        if (result.rows.length === 0) return;
-        const messages = result.rows[0].tlchats || [];
-        if (index >= messages.length) return;
-        let msgObj;
-        try { msgObj = JSON.parse(messages[index]); } catch (e) { console.error("editTLMessage: JSON parse error at index", index, e); return; }
-        msgObj.data = newData;
-        msgObj.edited = true;
-        msgObj.editedAt = editedAt;
-        messages[index] = JSON.stringify(msgObj);
-        await pgPool.query(
-          `UPDATE projectschema.clientproject SET tlchats = $1 WHERE project_id = $2`,
-          [messages, projectIdNum]
-        );
-        io.to(`project_${projectId}`).emit("tlMessageEdited", {
-          projectId, index,
-          newData: msgObj.data,
-          editedAt: msgObj.editedAt,
-        });
-      } catch (e) { console.error("editTLMessage error:", e); }
-    });
+// ===================== TL EDIT =====================
+// ===================== IMPROVED TL EDIT =====================
+socket.on("editTLMessage", async (data) => {
+  const { projectId, index, newData, editedAt, timestamp } = data;
+  const projectIdNum = Number(projectId);
+  if (isNaN(projectIdNum)) return;
 
-    socket.on("deleteTLMessage", async (data) => {
-      const { projectId, index, timestamp } = data;
-      const projectIdNum = Number(projectId);
-      if (isNaN(projectIdNum) || index === undefined || index === null) return;
-      try {
-        const result = await pgPool.query(
-          `SELECT tlchats, tlaudios FROM projectschema.clientproject WHERE project_id = $1`,
-          [projectIdNum]
-        );
-        if (result.rows.length === 0) return;
-        let field = "tlchats";
-        let messages = result.rows[0].tlchats || [];
-        if (index >= messages.length) { field = "tlaudios"; messages = result.rows[0].tlaudios || []; }
-        if (index >= messages.length) { console.error("deleteTLMessage: index out of bounds", index); return; }
-        let msgObj;
-        try { msgObj = JSON.parse(messages[index]); } catch (e) { console.error("deleteTLMessage: JSON parse error", e); return; }
-        msgObj.isDeleted = true;
-        msgObj.deletedAt = timestamp;
-        msgObj.data = null;
-        messages[index] = JSON.stringify(msgObj);
-        await pgPool.query(
-          `UPDATE projectschema.clientproject SET ${field} = $1 WHERE project_id = $2`,
-          [messages, projectIdNum]
-        );
-        io.to(`project_${projectId}`).emit("tlMessageDeleted", {
-          projectId, index,
-          deletedAt: msgObj.deletedAt,
-        });
-      } catch (e) { console.error("deleteTLMessage error:", e); }
-    });
+  try {
+    const result = await pgPool.query(
+      `SELECT tlchats FROM projectschema.clientproject WHERE project_id = $1`,
+      [projectIdNum]
+    );
+    if (result.rows.length === 0) return;
 
-    // ─── HEAD MESSAGE EDIT / DELETE ───────────────────────────────────────────
-    socket.on("editHeadMessage", async (data) => {
-      const { projectId, index, newData, editedAt } = data;
-      const projectIdNum = Number(projectId);
-      if (isNaN(projectIdNum) || index === undefined || index === null) return;
-      try {
-        const result = await pgPool.query(
-          `SELECT headchats FROM projectschema.clientproject WHERE project_id = $1`,
-          [projectIdNum]
-        );
-        if (result.rows.length === 0) return;
-        const messages = result.rows[0].headchats || [];
-        if (index >= messages.length) return;
-        let msgObj;
-        try { msgObj = JSON.parse(messages[index]); } catch (e) { console.error("editHeadMessage: JSON parse error at index", index, e); return; }
-        msgObj.data = newData;
-        msgObj.edited = true;
-        msgObj.editedAt = editedAt;
-        messages[index] = JSON.stringify(msgObj);
-        await pgPool.query(
-          `UPDATE projectschema.clientproject SET headchats = $1 WHERE project_id = $2`,
-          [messages, projectIdNum]
-        );
-        io.to(`project_${projectId}`).emit("headMessageEdited", {
-          projectId, index,
-          newData: msgObj.data,
-          editedAt: msgObj.editedAt,
-        });
-      } catch (e) { console.error("editHeadMessage error:", e); }
-    });
+    const messages = result.rows[0].tlchats || [];
+    let foundIndex = -1;
 
-    socket.on("deleteHeadMessage", async (data) => {
-      const { projectId, index, timestamp } = data;
-      const projectIdNum = Number(projectId);
-      if (isNaN(projectIdNum) || index === undefined || index === null) return;
-      try {
-        const result = await pgPool.query(
-          `SELECT headchats, headaudios FROM projectschema.clientproject WHERE project_id = $1`,
-          [projectIdNum]
-        );
-        if (result.rows.length === 0) return;
-        let field = "headchats";
-        let messages = result.rows[0].headchats || [];
-        if (index >= messages.length) { field = "headaudios"; messages = result.rows[0].headaudios || []; }
-        if (index >= messages.length) { console.error("deleteHeadMessage: index out of bounds", index); return; }
-        let msgObj;
-        try { msgObj = JSON.parse(messages[index]); } catch (e) { console.error("deleteHeadMessage: JSON parse error", e); return; }
-        msgObj.isDeleted = true;
-        msgObj.deletedAt = timestamp;
-        msgObj.data = null;
-        messages[index] = JSON.stringify(msgObj);
-        await pgPool.query(
-          `UPDATE projectschema.clientproject SET ${field} = $1 WHERE project_id = $2`,
-          [messages, projectIdNum]
-        );
-        io.to(`project_${projectId}`).emit("headMessageDeleted", {
-          projectId, index,
-          deletedAt: msgObj.deletedAt,
-        });
-      } catch (e) { console.error("deleteHeadMessage error:", e); }
+    // Prefer timestamp (more reliable)
+    if (timestamp) {
+      const targetTime = new Date(timestamp).getTime();
+      for (let i = 0; i < messages.length; i++) {
+        try {
+          const m = JSON.parse(messages[i]);
+          if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) {
+            foundIndex = i;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    // Fallback to index
+    if (foundIndex === -1 && typeof index === "number" && index >= 0 && index < messages.length) {
+      foundIndex = index;
+    }
+
+    if (foundIndex === -1) return;
+
+    let msgObj = JSON.parse(messages[foundIndex]);
+
+    // 2-minute rule
+    if (Date.now() - new Date(msgObj.timestamp).getTime() > 2 * 60 * 1000) return;
+
+    msgObj.data = newData;
+    msgObj.edited = true;
+    msgObj.editedAt = editedAt;
+
+    messages[foundIndex] = JSON.stringify(msgObj);
+
+    await pgPool.query(
+      `UPDATE projectschema.clientproject SET tlchats = $1 WHERE project_id = $2`,
+      [messages, projectIdNum]
+    );
+
+    io.to(`project_${projectId}`).emit("tlMessageEdited", {
+      projectId,
+      index: foundIndex,
+      newData: msgObj.data,
+      editedAt: msgObj.editedAt,
+      timestamp: msgObj.timestamp,
     });
+  } catch (e) {
+    console.error("editTLMessage error:", e);
+  }
+});
+
+// ===================== IMPROVED TL DELETE =====================
+socket.on("deleteTLMessage", async (data) => {
+  const { projectId, index, timestamp } = data;
+  const projectIdNum = Number(projectId);
+  if (isNaN(projectIdNum)) return;
+
+  try {
+    const result = await pgPool.query(
+      `SELECT tlchats FROM projectschema.clientproject WHERE project_id = $1`,
+      [projectIdNum]
+    );
+    if (result.rows.length === 0) return;
+
+    const messages = result.rows[0].tlchats || [];
+    let foundIndex = -1;
+
+    // Prefer timestamp
+    if (timestamp) {
+      const targetTime = new Date(timestamp).getTime();
+      for (let i = 0; i < messages.length; i++) {
+        try {
+          const m = JSON.parse(messages[i]);
+          if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) {
+            foundIndex = i;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    // Fallback to index
+    if (foundIndex === -1 && typeof index === "number" && index >= 0 && index < messages.length) {
+      foundIndex = index;
+    }
+
+    if (foundIndex === -1) return;
+
+    let msgObj = JSON.parse(messages[foundIndex]);
+
+    if (Date.now() - new Date(msgObj.timestamp).getTime() > 2 * 60 * 1000) return;
+
+    msgObj.isDeleted = true;
+    msgObj.deletedAt = new Date().toISOString();
+    msgObj.data = null;
+    msgObj.caption = null;
+
+    messages[foundIndex] = JSON.stringify(msgObj);
+
+    await pgPool.query(
+      `UPDATE projectschema.clientproject SET tlchats = $1 WHERE project_id = $2`,
+      [messages, projectIdNum]
+    );
+
+    io.to(`project_${projectId}`).emit("tlMessageDeleted", {
+      projectId,
+      index: foundIndex,
+      timestamp: msgObj.timestamp,
+      deletedAt: msgObj.deletedAt,
+    });
+  } catch (e) {
+    console.error("deleteTLMessage error:", e);
+  }
+});
+
+// ─── HEAD MESSAGE EDIT ────────────────────────────────────────────────
+socket.on("editHeadMessage", async (data) => {
+  const { projectId, newData, editedAt, timestamp } = data;
+  const projectIdNum = Number(projectId);
+  if (isNaN(projectIdNum) || !timestamp) return;
+
+  try {
+    const result = await pgPool.query(
+      `SELECT headchats FROM projectschema.clientproject WHERE project_id = $1`,
+      [projectIdNum]
+    );
+    if (result.rows.length === 0) return;
+
+    const messages = result.rows[0].headchats || [];
+    const targetTime = new Date(timestamp).getTime();
+    let foundIndex = -1;
+
+    for (let i = 0; i < messages.length; i++) {
+      try {
+        const m = JSON.parse(messages[i]);
+        if (new Date(m.timestamp).getTime() === targetTime) {
+          foundIndex = i;
+          break;
+        }
+      } catch {}
+    }
+
+    if (foundIndex === -1) {
+      console.log("editHeadMessage: message not found", timestamp);
+      return;
+    }
+
+    let msgObj = JSON.parse(messages[foundIndex]);
+
+    // 2-minute rule
+    if (Date.now() - new Date(msgObj.timestamp).getTime() > 2 * 60 * 1000) {
+      console.log("⏱️ editHeadMessage blocked – time exceeded");
+      return;
+    }
+
+    if (msgObj.type !== "text") return;
+
+    msgObj.data = newData;
+    msgObj.edited = true;
+    msgObj.editedAt = editedAt;
+
+    messages[foundIndex] = JSON.stringify(msgObj);
+
+    await pgPool.query(
+      `UPDATE projectschema.clientproject SET headchats = $1 WHERE project_id = $2`,
+      [messages, projectIdNum]
+    );
+
+    io.to(`project_${projectId}`).emit("headMessageEdited", {
+      projectId,
+      index: foundIndex,
+      newData: msgObj.data,
+      editedAt: msgObj.editedAt,
+      timestamp: msgObj.timestamp,
+    });
+  } catch (e) {
+    console.error("editHeadMessage error:", e);
+  }
+});
+
+// ─── HEAD MESSAGE DELETE ──────────────────────────────────────────────
+socket.on("deleteHeadMessage", async (data) => {
+  const { projectId, index, timestamp } = data;
+  const projectIdNum = Number(projectId);
+  if (isNaN(projectIdNum)) return;
+
+  try {
+    const result = await pgPool.query(
+      `SELECT headchats, headaudios FROM projectschema.clientproject WHERE project_id = $1`,
+      [projectIdNum]
+    );
+    if (result.rows.length === 0) return;
+
+    let field = "headchats";
+    let messages = result.rows[0].headchats || [];
+    let foundIndex = -1;
+
+    // ---------- 1. Prefer exact index (most reliable after load / confirmation) ----------
+    if (typeof index === "number" && index >= 0 && index < messages.length) {
+      foundIndex = index;
+    }
+
+    // ---------- 2. Fallback: tolerant timestamp search in headchats ----------
+    if (foundIndex === -1 && timestamp) {
+      const targetTime = new Date(timestamp).getTime();
+      for (let i = 0; i < messages.length; i++) {
+        try {
+          const m = JSON.parse(messages[i]);
+          if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) { // 3 sec tolerance
+            foundIndex = i;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    // ---------- 3. Try headaudios ----------
+    if (foundIndex === -1) {
+      field = "headaudios";
+      messages = result.rows[0].headaudios || [];
+
+      if (typeof index === "number" && index >= 0 && index < messages.length) {
+        foundIndex = index;
+      } else if (timestamp) {
+        const targetTime = new Date(timestamp).getTime();
+        for (let i = 0; i < messages.length; i++) {
+          try {
+            const m = JSON.parse(messages[i]);
+            if (Math.abs(new Date(m.timestamp).getTime() - targetTime) < 3000) {
+              foundIndex = i;
+              break;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    if (foundIndex === -1) {
+      console.log("❌ deleteHeadMessage: message NOT FOUND", { index, timestamp });
+      return;
+    }
+
+    let msgObj;
+    try {
+      msgObj = JSON.parse(messages[foundIndex]);
+    } catch (e) {
+      console.error("JSON parse error in deleteHeadMessage", e);
+      return;
+    }
+
+    // 2-minute rule
+    if (Date.now() - new Date(msgObj.timestamp).getTime() > 2 * 60 * 1000) {
+      console.log("⏱️ deleteHeadMessage blocked – time exceeded");
+      return;
+    }
+
+    // Soft delete
+    msgObj.isDeleted = true;
+    msgObj.deletedAt = new Date().toISOString();
+    msgObj.data = null;
+    msgObj.caption = null;
+
+    messages[foundIndex] = JSON.stringify(msgObj);
+
+    await pgPool.query(
+      `UPDATE projectschema.clientproject SET ${field} = $1 WHERE project_id = $2`,
+      [messages, projectIdNum]
+    );
+
+    console.log("✅ deleteHeadMessage success", { field, foundIndex, timestamp: msgObj.timestamp });
+
+    io.to(`project_${projectId}`).emit("headMessageDeleted", {
+      projectId,
+      index: foundIndex,
+      timestamp: msgObj.timestamp,
+      deletedAt: msgObj.deletedAt,
+    });
+  } catch (e) {
+    console.error("deleteHeadMessage error:", e);
+  }
+});
 
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
