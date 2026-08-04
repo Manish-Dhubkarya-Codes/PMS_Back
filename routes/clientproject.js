@@ -380,20 +380,29 @@ router.post("/submit_request", async function (req, res) {
       const newRequestData = newRequestResult.rows[0];
       
       // ==================== LIVE UPDATE FOR ALL EMPLOYEES ====================
-      if (io) {
-        io.to("employees").emit("newEmployeeRequest", {
-          request_id: newRequestData.request_id,
-          project_id: newRequestData.project_id,
-          employeeid: newRequestData.employeeid,
-          status: newRequestData.status,
-          workstream: newRequestData.workstream,
-          title: newRequestData.title,
-          deadline: newRequestData.deadline,
-          description: newRequestData.description,
-          clientName: newRequestData.clientName,
-          created_at: newRequestData.created_at || new Date().toISOString()
-        });
-      }
+// ==================== LIVE UPDATE FOR ALL EMPLOYEES + TL ====================
+if (io) {
+  const payload = {
+    request_id: newRequestData.request_id,
+    project_id: String(newRequestData.project_id),
+    employeeId: newRequestData.employeeid,                 // camelCase for frontend
+    status: newRequestData.status || "pending",
+    workstream: newRequestData.workstream,
+    title: newRequestData.title,
+    deadline: newRequestData.deadline,
+    description: newRequestData.description,
+    clientName: newRequestData.clientName,
+    employeeName: newRequestData.employeeName,
+    employeeDesignation: newRequestData.employeeDesignation,
+    employeePic: newRequestData.employeePic || null,
+    created_at: newRequestData.created_at || new Date().toISOString()
+  };
+
+  // Send to Team Leader room AND employees room
+  io.to("tl").emit("newEmployeeRequest", payload);
+  io.to("employees").emit("newEmployeeRequest", payload);
+}
+// =====================================================================
       // =====================================================================
     }
 
@@ -851,49 +860,56 @@ router.post("/save_project", async function (req, res) {
       console.error("Error fetching heads or TLs:", err);
     }
     // ---------- REUSABLE EMAIL TEMPLATE ----------
-    // ---------- REUSABLE EMAIL TEMPLATE ----------
-    const sendProjectEmail = async (to, name, role) => {
-      if (!to || !to.includes('@')) {
-        console.warn(`Skipping invalid email for ${role}: ${to}`);
-        return;
-      }
-      const dashboardUrl = `${process.env.PMS_URL || 'https://ccitpms.com/'}`;
-      const msg = {
-        from: process.env.SMTP_USER,
-        to,
-        subject: `New Project Uploaded: "${projectTitle}"`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 620px; margin: auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px; background:#fafafa;">
-            <h2 style="color: #1a73e8; text-align:center;">New Project Created</h2>
-            <p>Hello <strong>${name}</strong>,</p>
-            <p><strong>${creatorClient.clientName}</strong> has uploaded a new project:</p>
-            <table style="width:100%; border-collapse:collapse; margin:20px 0; background:white; border-radius:6px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
-              <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Title</td><td style="padding:12px;">${projectTitle}</td></tr>
-              <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Workstream</td><td style="padding:12px;">${workstream}</td></tr>
-              <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Deadline</td><td style="padding:12px;">${new Date(projectDeadline).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</td></tr>
-              <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Budget</td><td style="padding:12px;">₹${parseFloat(budget).toLocaleString()}</td></tr>
-              <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Project ID</td><td style="padding:12px;">#${projectId}</td></tr>
-            </table>
-            <p style="text-align:center;">
-              <a href="${dashboardUrl}"
-                 style="background:#1a73e8; color:white; padding:12px 28px; text-decoration:none; border-radius:6px; font-weight:bold; display:inline-block;">
-                Open Project Dashboard
-              </a>
-            </p>
-            <hr style="border:0; border-top:1px solid #eee; margin:30px 0;">
-            <p style="color:#777; font-size:12px; text-align:center;">
-              Automated message – <strong>CogniCode Project Management</strong>
-            </p>
-          </div>
-        `
-      };
-      try {
-        await transporter.sendMail(msg);
-        console.log(`Email sent to ${role}: ${to}`);
-      } catch (mailErr) {
-        console.error(`Failed to send email to ${role} (${to}):`, mailErr);
-      }
-    };
+const sendProjectEmail = async (to, name, role) => {
+  if (!to || !to.includes('@')) {
+    console.warn(`Skipping invalid email for ${role}: ${to}`);
+    return;
+  }
+
+  const dashboardUrl = `${process.env.PMS_URL || 'https://ccitpms.com/'}`;
+
+  // Budget row only for Head, NOT for Team Leader
+  const budgetRow = role === "Team Leader" 
+    ? "" 
+    : `<tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Budget</td><td style="padding:12px;">₹${parseFloat(budget).toLocaleString()}</td></tr>`;
+
+  const msg = {
+    from: process.env.SMTP_USER,
+    to,
+    subject: `New Project Uploaded: "${projectTitle}"`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 620px; margin: auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px; background:#fafafa;">
+        <h2 style="color: #1a73e8; text-align:center;">New Project Created</h2>
+        <p>Hello <strong>${name}</strong>,</p>
+        <p><strong>${creatorClient.clientName}</strong> has uploaded a new project:</p>
+        <table style="width:100%; border-collapse:collapse; margin:20px 0; background:white; border-radius:6px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+          <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Title</td><td style="padding:12px;">${projectTitle}</td></tr>
+          <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Workstream</td><td style="padding:12px;">${workstream}</td></tr>
+          <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Deadline</td><td style="padding:12px;">${new Date(projectDeadline).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</td></tr>
+          ${budgetRow}
+          <tr><td style="padding:12px; font-weight:bold; background:#f1f3f5;">Project ID</td><td style="padding:12px;">#${projectId}</td></tr>
+        </table>
+        <p style="text-align:center; margin:30px 0;">
+          <a href="${dashboardUrl}"
+             style="background:#1a73e8; color:white; padding:12px 28px; text-decoration:none; border-radius:6px; font-weight:bold; display:inline-block;">
+            Go to Dashboard
+          </a>
+        </p>
+        <hr style="border:0; border-top:1px solid #eee; margin:30px 0;">
+        <p style="color:#777; font-size:12px; text-align:center;">
+          Automated message – <strong>CogniCode Project Management</strong>
+        </p>
+      </div>
+    `
+  };
+
+  try {
+    await transporter.sendMail(msg);
+    console.log(`✅ Project email sent to ${role}: ${to}`);
+  } catch (err) {
+    console.error(`Failed to send email to ${role} ${to}:`, err);
+  }
+};
     // ---------- SEND EMAILS ----------
     try {
       // 1. CREATOR CLIENT (Confirmation)
@@ -943,6 +959,32 @@ router.post("/save_project", async function (req, res) {
     } catch (mailErr) {
       console.error("Email failed (non-critical):", mailErr);
     }
+    // ==================== LIVE UPDATE FOR ALL TEAM LEADERS ====================
+  // ==================== LIVE UPDATE FOR ALL TLs + HEADS + EMPLOYEES ====================
+if (io) {
+  const payload = {
+    project_id: projectId,
+    title: projectTitle,
+    workstream,
+    clientName: creatorClient.clientName,
+    status: "Hold",                 // new projects start as Hold
+    deadline: projectDeadline,
+    description: description || "",
+    budget: budget || 0,
+  };
+
+  // Team Leaders (Sales + Technical)
+  io.to("tl").emit("newProjectCreated", payload);
+
+  // Heads
+  io.to("head").emit("newProjectCreated", payload);
+
+  // Employees (so Active tab can also react if needed)
+  io.to("employees").emit("newProjectCreated", payload);
+
+  console.log("📢 Emitted newProjectCreated to TL + Head + Employees rooms");
+}
+// ====================================================================================
     // ---------- SUCCESS ----------
     return res.status(200).json({
       status: true,
