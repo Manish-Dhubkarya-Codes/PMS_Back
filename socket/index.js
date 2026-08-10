@@ -43,6 +43,13 @@ function emitChatToRoom(socket, projectId, fromRole, msg) {
   socket.emit("messageAck", { projectId, fromRole, msg });
 }
 
+/** TL ↔ Employee shared room (projectTLClientChats) */
+function emitToMonitorRoom(socket, projectId, fromRole, msg) {
+  const room = `tl_monitor_${projectId}`;
+  socket.to(room).emit("newTLMonitorMessage", { projectId, fromRole, msg });
+  socket.emit("messageAck", { projectId, fromRole, msg });
+}
+
 module.exports = (io) => {
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
@@ -497,31 +504,63 @@ socket.on("sendTLMessage", async (data) => {
 });
 
 socket.on("sendTLToMonitorMessage", async (data) => {
-  const { projectId, type, msgData, timestamp, senderId, tempId, replyTo, senderName } = data;
+  const { projectId, type, msgData, timestamp, senderId, tempId, replyTo, caption } = data;
   try {
     const projectIdNum = Number(projectId);
     if (isNaN(projectIdNum)) return;
+    if (!claimTempId(`mon_${projectIdNum}`, tempId)) return;
 
     const projectCheck = await pgPool.query(
-      "SELECT project_id FROM projectschema.clientproject WHERE project_id = $1",
+      "SELECT project_id, teamleaderid FROM projectschema.clientproject WHERE project_id = $1",
       [projectIdNum]
     );
     if (projectCheck.rows.length === 0) return;
 
     const senderIdNum = Number(senderId);
     const tlCheck = await pgPool.query(
-      'SELECT "employeeId" FROM "Entities".employees WHERE "employeeId" = $1 AND role = $2',
-      [senderIdNum, 'Team Leader']
-    );
-    if (tlCheck.rows.length === 0) return;
-
-    // ====================== FETCH REAL SENDER NAME & PIC (THIS WAS MISSING) ======================
-    const senderResult = await pgPool.query(
-      'SELECT "employeeName" as senderName, "employeePic" as senderPic FROM "Entities".employees WHERE "employeeId" = $1',
+      `SELECT "employeeId", "employeeName", "employeePic" FROM "Entities".employees
+       WHERE "employeeId" = $1
+         AND (role = 'Team Leader' OR LOWER(COALESCE(role,'')) IN ('team leader','teamleader','tl'))`,
       [senderIdNum]
     );
-    // const senderName = senderResult.rows[0]?.senderName || "Team Leader";
-    const senderPic  = senderResult.rows[0]?.senderPic || "";
+    const isAssignedTl =
+      projectCheck.rows[0]?.teamleaderid != null &&
+      String(projectCheck.rows[0].teamleaderid) === String(senderIdNum);
+    if (tlCheck.rows.length === 0 && !isAssignedTl) {
+      console.warn("sendTLToMonitorMessage rejected: not TL", { senderId, projectId });
+      return;
+    }
+
+    // Always resolve real name/pic from DB (never trust client alone)
+    let resolvedName = data.senderName || null;
+    let resolvedPic = data.senderPic || "";
+    if (tlCheck.rows[0]) {
+      resolvedName = tlCheck.rows[0].employeeName || resolvedName;
+      resolvedPic = tlCheck.rows[0].employeePic || resolvedPic;
+    } else {
+      const senderResult = await pgPool.query(
+        'SELECT "employeeName", "employeePic" FROM "Entities".employees WHERE "employeeId" = $1',
+        [senderIdNum]
+      );
+      resolvedName = senderResult.rows[0]?.employeeName || resolvedName;
+      resolvedPic = senderResult.rows[0]?.employeePic || resolvedPic;
+    }
+    resolvedName = resolvedName || "Team Leader";
+
+    // Normalize file payload
+    let normalizedData = msgData;
+    if ((type === "file" || type === "audio") && msgData && typeof msgData === "object") {
+      normalizedData = {
+        ...msgData,
+        name: msgData.name || "File",
+        url: msgData.url || "",
+        type: msgData.type || (type === "audio" ? "audio/mpeg" : "application/octet-stream"),
+      };
+    }
+
+    const storedType = type === "audio" ? "file" : type;
+    const messageId = makeMessageId();
+    const ts = timestamp || new Date().toISOString();
 
     // Check if row exists, create if not
     const chatRowCheck = await pgPool.query(
@@ -535,21 +574,27 @@ socket.on("sendTLToMonitorMessage", async (data) => {
       );
     }
 
-    const chatJson = JSON.stringify({ 
-      type, 
-      data: msgData, 
-      timestamp, 
+    const chatJson = JSON.stringify({
+      type: storedType,
+      data: normalizedData,
+      caption: caption || data.caption || null,
+      timestamp: ts,
       seen_by: [],
       replyTo: replyTo || null,
-      senderName,     // ← ADDED
-      senderPic,      // ← ADDED
-      senderId: senderId.toString()  // ← ADDED (for isMe check)
+      senderName: resolvedName,
+      senderPic: resolvedPic,
+      senderId: String(senderIdNum),
+      fromRole: "tl",
+      fromTL: true,
+      messageId,
+      tempId: tempId || null,
     });
 
-    const field = type === "audio" ? '"TLAudios"' : '"TLChats"';
+    // Files + audio in TLAudios; text in TLChats
+    const field = (type === "audio" || type === "file") ? '"TLAudios"' : '"TLChats"';
     const query = `
       UPDATE projectschema."projectTLClientChats"
-      SET ${field} = array_append(${field}, $1),
+      SET ${field} = array_append(COALESCE(${field}, ARRAY[]::text[]), $1),
           "TeamLeaderId" = $3
       WHERE "projectId" = $2
       RETURNING ${field} as field_data
@@ -560,40 +605,38 @@ socket.on("sendTLToMonitorMessage", async (data) => {
       const newIndex = result.rows[0].field_data.length - 1;
       const msg = {
         id: newIndex,
-        type,
-        data: msgData,
-        timestamp,
+        messageId,
+        type: storedType,
+        data: normalizedData,
+        caption: caption || data.caption || null,
+        timestamp: ts,
         seen_by: [],
         replyTo: replyTo || null,
-        senderName,     // ← ADDED (live)
-        senderPic,      // ← ADDED (live)
-        senderId: senderId.toString(), // ← ADDED
-        tempId
+        senderName: resolvedName,
+        senderPic: resolvedPic,
+        senderId: String(senderIdNum),
+        fromRole: "tl",
+        fromTL: true,
+        tempId,
       };
 
-      console.log("📤 EMITTING TO ROOM:", `tl_monitor_${projectId}`);
-      io.to(`tl_monitor_${projectId}`).emit("newTLMonitorMessage", {
-        fromRole: "tl",
-        msg,
-        projectId,
-      });
-
-      // Push notification (unchanged)
-      // ... (your existing push code)
+      console.log("📤 EMITTING TO MONITOR ROOM:", `tl_monitor_${projectId}`, resolvedName);
+      emitToMonitorRoom(socket, projectId, "tl", msg);
     }
   } catch (e) {
     console.error("Socket Error (sendTLToMonitorMessage):", e);
   }
 });
 
-// ====================== NEW: UNIFIED EMPLOYEE CHAT (No Monitor Logic) ======================
+// ====================== UNIFIED EMPLOYEE CHAT ======================
 socket.on("sendEmployeeMessage", async (data) => {
-  const { projectId, type, msgData, timestamp, senderId, tempId, replyTo, senderName } = data;
-  console.log(`🔔 sendEmployeeMessage received: projectId=${projectId}, senderId=${senderId}, type=${type}, senderName=${senderName}`);
+  const { projectId, type, msgData, timestamp, senderId, tempId, replyTo, caption } = data;
+  console.log(`🔔 sendEmployeeMessage received: projectId=${projectId}, senderId=${senderId}, type=${type}`);
 
   try {
     const projectIdNum = Number(projectId);
     if (isNaN(projectIdNum)) return;
+    if (!claimTempId(`mon_${projectIdNum}`, tempId)) return;
 
     const projectCheck = await pgPool.query(
       "SELECT project_id FROM projectschema.clientproject WHERE project_id = $1",
@@ -603,37 +646,58 @@ socket.on("sendEmployeeMessage", async (data) => {
 
     const senderIdNum = Number(senderId);
 
-    // Simple check: Is this employee assigned to the project?
+    // Is this employee assigned to the project?
     const assignedQuery = `
       SELECT DISTINCT employeeid::TEXT as employeeid_str
       FROM projectschema."employeeRequests"
       WHERE "project_id" = $1 AND "status" IN ('accepted', 'TLAssign')
     `;
     const assignedResult = await pgPool.query(assignedQuery, [projectIdNum]);
-    const assignedEmployees = assignedResult.rows.map(row => row.employeeid_str);
+    const assignedEmployees = assignedResult.rows.map((row) => row.employeeid_str);
 
-    if (!assignedEmployees.includes(senderId.toString())) {
+    if (!assignedEmployees.includes(String(senderId))) {
       console.log(`❌ Employee ${senderId} not assigned to project ${projectId}`);
       return;
     }
 
-    // Fetch real sender details
+    // Always resolve real name/pic from DB
     const senderResult = await pgPool.query(
-      'SELECT "employeeName" as senderName, "employeePic" as senderPic FROM "Entities".employees WHERE "employeeId" = $1',
+      'SELECT "employeeName", "employeePic" FROM "Entities".employees WHERE "employeeId" = $1',
       [senderIdNum]
     );
-    // const senderName = senderResult.rows[0]?.senderName || "Employee";
-    const senderPic  = senderResult.rows[0]?.senderPic || "";
+    const resolvedName =
+      senderResult.rows[0]?.employeeName || data.senderName || "Employee";
+    const resolvedPic =
+      senderResult.rows[0]?.employeePic || data.senderPic || "";
 
-    const chatJson = JSON.stringify({ 
-      type, 
-      data: msgData, 
-      timestamp, 
+    let normalizedData = msgData;
+    if ((type === "file" || type === "audio") && msgData && typeof msgData === "object") {
+      normalizedData = {
+        ...msgData,
+        name: msgData.name || "File",
+        url: msgData.url || "",
+        type: msgData.type || (type === "audio" ? "audio/mpeg" : "application/octet-stream"),
+      };
+    }
+
+    const storedType = type === "audio" ? "file" : type;
+    const messageId = makeMessageId();
+    const ts = timestamp || new Date().toISOString();
+
+    const chatJson = JSON.stringify({
+      type: storedType,
+      data: normalizedData,
+      caption: caption || data.caption || null,
+      timestamp: ts,
       seen_by: [],
       replyTo: replyTo || null,
-      senderId: senderId.toString(),
-      senderName,
-      senderPic
+      senderId: String(senderIdNum),
+      senderName: resolvedName,
+      senderPic: resolvedPic,
+      fromRole: "employee",
+      fromTL: false,
+      messageId,
+      tempId: tempId || null,
     });
 
     // Ensure chat row exists
@@ -648,10 +712,10 @@ socket.on("sendEmployeeMessage", async (data) => {
       );
     }
 
-    const field = type === "audio" ? '"MonitorAudios"' : '"MonitorChats"';
+    const field = (type === "audio" || type === "file") ? '"MonitorAudios"' : '"MonitorChats"';
     const query = `
       UPDATE projectschema."projectTLClientChats"
-      SET ${field} = array_append(${field}, $1)
+      SET ${field} = array_append(COALESCE(${field}, ARRAY[]::text[]), $1)
       WHERE "projectId" = $2
       RETURNING ${field} as field_data
     `;
@@ -661,42 +725,45 @@ socket.on("sendEmployeeMessage", async (data) => {
       const newIndex = result.rows[0].field_data.length - 1;
       const msg = {
         id: newIndex,
-        type,
-        data: msgData,
-        timestamp,
+        messageId,
+        type: storedType,
+        data: normalizedData,
+        caption: caption || data.caption || null,
+        timestamp: ts,
         seen_by: [],
         replyTo: replyTo || null,
-        senderId: senderId.toString(),
-        senderName,
-        senderPic,
-        tempId
+        senderId: String(senderIdNum),
+        senderName: resolvedName,
+        senderPic: resolvedPic,
+        fromRole: "employee",
+        fromTL: false,
+        tempId,
       };
 
-      console.log(`📤 EMPLOYEE MESSAGE SENT → Room: tl_monitor_${projectId}`);
-
-      // Broadcast to ALL in the shared room (Team Leader + All Employees)
-      io.to(`tl_monitor_${projectId}`).emit("newTLMonitorMessage", {
-        fromRole: "employee",
-        msg,
-        projectId
-      });
+      console.log(`📤 EMPLOYEE MESSAGE SENT → Room: tl_monitor_${projectId}`, resolvedName);
+      emitToMonitorRoom(socket, projectId, "employee", msg);
 
       // Push to Team Leader
       try {
-        const proj = await pgPool.query(`
-          SELECT teamleaderid FROM projectschema.clientproject WHERE project_id = $1
-        `, [projectIdNum]);
+        const proj = await pgPool.query(
+          `SELECT teamleaderid FROM projectschema.clientproject WHERE project_id = $1`,
+          [projectIdNum]
+        );
         if (proj.rows[0]?.teamleaderid) {
           await sendPushNotification(
             proj.rows[0].teamleaderid.toString(),
-            'employee',
-            type === "audio" ? 'New Employee File' : 'New Employee Message',
-            type === "audio" ? 'File attached' : (typeof msgData === 'string' ? msgData.slice(0, 50) + '...' : 'File attached'),
+            "employee",
+            type === "text" ? "New Employee Message" : "New Employee File",
+            type === "text"
+              ? typeof normalizedData === "string"
+                ? normalizedData.slice(0, 50) + "..."
+                : "File attached"
+              : `File: ${normalizedData?.name || "attached"}`,
             projectIdNum
           );
         }
       } catch (pushErr) {
-        console.error('Push error:', pushErr);
+        console.error("Push error:", pushErr);
       }
     }
   } catch (e) {
