@@ -208,6 +208,17 @@ app.use((req, res, next) => {
 // ======================================================
 
 app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  if (err.status === 404) {
+    console.warn('⚠️ Not Found:', req.originalUrl);
+    return res.status(404).json({
+      success: false,
+      message: err.message || 'Not Found'
+    });
+  }
 
   console.error('❌ Global Error:', err);
 

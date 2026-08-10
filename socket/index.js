@@ -1,9 +1,48 @@
 //socket.js
 
+const crypto = require("crypto");
 const pgPool = require("../routes/PostgreSQLPool");
 // const { sendPushNotification } = require('../routes/clientproject');
 const clientProject = require('../routes/clientproject');
 const { sendPushNotification } = clientProject;
+
+// In-memory idempotency for chat file/text emits (prevents double-save on double click / reconnect)
+// key = `${projectId}:${tempId}` → expires after TTL
+const recentTempIds = new Map();
+const TEMP_ID_TTL_MS = 5 * 60 * 1000;
+
+function claimTempId(projectId, tempId) {
+  if (!tempId) return true; // no tempId → allow (legacy clients)
+  const key = `${projectId}:${tempId}`;
+  const now = Date.now();
+  // purge stale
+  for (const [k, t] of recentTempIds) {
+    if (now - t > TEMP_ID_TTL_MS) recentTempIds.delete(k);
+  }
+  if (recentTempIds.has(key)) {
+    console.warn("⛔ Duplicate tempId ignored:", key);
+    return false;
+  }
+  recentTempIds.set(key, now);
+  return true;
+}
+
+function makeMessageId() {
+  return crypto.randomUUID();
+}
+
+/**
+ * Deliver chat without double-bubble on sender:
+ *  - Others in project room → "newMessage"
+ *  - Sender only → "messageAck" (upgrade tempId / attach server id)
+ * Never use io.to(room) for chat files — that re-delivers to the sender.
+ */
+function emitChatToRoom(socket, projectId, fromRole, msg) {
+  const room = `project_${projectId}`;
+  socket.to(room).emit("newMessage", { projectId, fromRole, msg });
+  socket.emit("messageAck", { projectId, fromRole, msg });
+}
+
 module.exports = (io) => {
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
@@ -102,10 +141,11 @@ socket.on("requestTLMonitorChats", async (projectId) => {
 });
 
 socket.on("sendClientMessage", async (data) => {
-  const { projectId, type, msgData, timestamp, mention, tempId, replyTo } = data;
+  const { projectId, type, msgData, timestamp, mention, tempId, replyTo, caption } = data;
   try {
     const projectIdNum = Number(projectId);
     if (isNaN(projectIdNum)) return;
+    if (!claimTempId(projectIdNum, tempId)) return;
 
     const projectCheck = await pgPool.query(
       "SELECT project_id FROM projectschema.clientproject WHERE project_id = $1",
@@ -125,29 +165,47 @@ socket.on("sendClientMessage", async (data) => {
       }
     }
 
-    let chatJson;
-try {
-  chatJson = JSON.stringify({
-    type,
-    data: msgData,
-    caption: data.caption || null,
-    timestamp,
-    seen_by: [],
-    mention: mention || null,
-    replyTo: replyTo || null
-  });
-  if (typeof chatJson !== 'string') {
-    throw new Error('Invalid JSON');
-  }
-} catch (strErr) {
-  console.error('Socket JSON failed:', strErr);
-  return;  // Skip invalid msg
-}
+    // Client messages must land in client* columns (not head*),
+    // so Client / Head / TL all reload the same history correctly.
+    const storedType = type === "audio" ? "file" : type;
+    const field = (type === "audio" || type === "file") ? "clientaudios" : "clientchats";
 
-    const field = type === "audio" ? "clientaudios" : "clientchats";
+    // Normalize file payload so clients never receive null MIME types
+    let normalizedData = msgData;
+    if ((type === "file" || type === "audio") && msgData && typeof msgData === "object") {
+      normalizedData = {
+        ...msgData,
+        name: msgData.name || "File",
+        url: msgData.url || "",
+        type: msgData.type || (type === "audio" ? "audio/mpeg" : "application/octet-stream"),
+      };
+    }
+
+    const messageId = makeMessageId();
+    const ts = timestamp || new Date().toISOString();
+    let chatJson;
+    try {
+      chatJson = JSON.stringify({
+        type: storedType,
+        data: normalizedData,
+        caption: caption || data.caption || null,
+        timestamp: ts,
+        seen_by: [],
+        mention: mention || null,
+        replyTo: replyTo || null,
+        fromRole: "client",
+        fromClient: true,
+        messageId,
+        tempId: tempId || null,
+      });
+    } catch (strErr) {
+      console.error("Socket JSON failed:", strErr);
+      return;
+    }
+
     const query = `
       UPDATE projectschema.clientproject
-      SET ${field} = array_append(${field}, $1)
+      SET ${field} = array_append(COALESCE(${field}, ARRAY[]::text[]), $1)
       WHERE project_id = $2
       RETURNING ${field}
     `;
@@ -155,116 +213,143 @@ try {
 
     if (result.rowCount > 0) {
       const newIndex = result.rows[0][field].length - 1;
-     const msg = {
-  id: newIndex,
-  type,
-  data: msgData,
-  caption: data.caption || null,
-  timestamp,
-  seen_by: [],
-  mention: mention || null,
-  replyTo: replyTo || null,
-  tempId,
-};
-      // Updated: Include projectId in payload
-      io.to(`project_${projectId}`).emit("newMessage", {
-        projectId,
+      const msg = {
+        id: newIndex,
+        messageId,
+        type: storedType,
+        data: normalizedData,
+        caption: caption || data.caption || null,
+        timestamp: ts,
+        seen_by: [],
+        mention: mention || null,
+        replyTo: replyTo || null,
+        tempId,
         fromRole: "client",
-        msg,
-      });
+        fromClient: true,
+      };
 
-      // NEW: Trigger push for head (if unread)
-      const projectQuery = await pgPool.query('SELECT headid FROM projectschema.clientproject WHERE project_id = $1', [projectIdNum]);
+      emitChatToRoom(socket, projectId, "client", msg);
+
+      const projectQuery = await pgPool.query(
+        "SELECT headid FROM projectschema.clientproject WHERE project_id = $1",
+        [projectIdNum]
+      );
       const headId = projectQuery.rows[0]?.headid;
-      if (headId && !msg.seen_by.includes('head')) {  // Only if unread
-        console.log(`🔍 Socket msg trigger for head ${headId}: Type="${type}", Unread=true`);
-        const title = type === 'text' ? 'New Client Message' : 'New Client File';
-        const body = type === 'text' ? (typeof msgData === 'string' ? msgData.slice(0, 50) + '...' : (msgData.name || 'File')) : `File: ${msgData.name}`;
-        console.log(`🚀 About to send push: Title="${title}", Body="${body}", Project=${projectId}`);  // NEW LOG
-        await sendPushNotification(headId.toString(), 'head', title, body, projectIdNum);
-      } else {
-        console.log(`⏭️ Skipped push for head ${headId}: Already seen`);
+      if (headId && !msg.seen_by.includes("head")) {
+        const title = type === "text" ? "New Client Message" : "New Client File";
+        const body =
+          type === "text"
+            ? typeof normalizedData === "string"
+              ? normalizedData.slice(0, 50) + "..."
+              : normalizedData?.name || "File"
+            : `File: ${normalizedData?.name || "Unknown"}`;
+        await sendPushNotification(headId.toString(), "head", title, body, projectIdNum);
       }
     }
   } catch (e) {
-    console.error("Socket Error:", e);
+    console.error("Socket Error (sendClientMessage):", e);
   }
 });
 
 socket.on("sendHeadMessage", async (data) => {
-  const { projectId, type, msgData, timestamp, mention, tempId, headId, replyTo } = data;  // ADD headId destructuring
+  console.log("HEAD MESSAGE RECEIVED:", data);
+
+  const { projectId, type, msgData, timestamp, mention, tempId, headId, replyTo, caption } = data;
+
   try {
     const projectIdNum = Number(projectId);
-    if (isNaN(projectIdNum)) return;
+    if (isNaN(projectIdNum)) {
+      console.warn("Invalid projectId");
+      return;
+    }
+    if (!claimTempId(projectIdNum, tempId)) return;
 
     const projectCheck = await pgPool.query(
       "SELECT project_id FROM projectschema.clientproject WHERE project_id = $1",
       [projectIdNum]
     );
-    if (projectCheck.rows.length === 0) return;
-
-    if (mention) {
-      // Head mention validation if needed
+    if (projectCheck.rows.length === 0) {
+      console.warn("Project not found:", projectIdNum);
+      return;
     }
 
-    // Validate headId (optional: check if exists in head table)
-    const headCheck = await pgPool.query(
-      'SELECT "headId" FROM "Entities".head WHERE "headId" = $1',
-      [headId]
-    );
-    if (headCheck.rows.length === 0) {
-      console.warn(`Invalid headId: ${headId}`);
-      return socket.emit('error', { message: 'Invalid headId' });
-    }
-
+    // Keep legacy layout: audio → headaudios, text+file → headchats
+    // (client/tl store files under *audios; head historically uses headchats for files)
+    const storedType = type === "audio" ? "file" : type;
     const field = type === "audio" ? "headaudios" : "headchats";
+
+    // Normalize file payload
+    let normalizedData = msgData;
+    if ((type === "file" || type === "audio") && msgData && typeof msgData === "object") {
+      normalizedData = {
+        ...msgData,
+        name: msgData.name || "File",
+        url: msgData.url || "",
+        type: msgData.type || (type === "audio" ? "audio/mpeg" : "application/octet-stream"),
+      };
+    }
+
+    const messageId = makeMessageId();
+    const ts = timestamp || new Date().toISOString();
     const chatJson = JSON.stringify({
-      type,
-      data: msgData,
-      caption: data.caption || null,
-      timestamp: timestamp || new Date().toISOString(),
+      type: storedType,
+      data: normalizedData,
+      caption: caption || data.caption || null,
+      timestamp: ts,
       seen_by: [],
       mention: mention || null,
-      replyTo: replyTo || null
+      replyTo: replyTo || null,
+      fromRole: "head",
+      fromHead: true,
+      messageId,
+      tempId: tempId || null,
     });
 
     const query = `
       UPDATE projectschema.clientproject
       SET ${field} = array_append(COALESCE(${field}, ARRAY[]::text[]), $1),
-          headid = COALESCE(headid, $3)  -- ADD THIS: Set headid if null
+          headid = COALESCE(headid, $3)
       WHERE project_id = $2
       RETURNING ${field}
     `;
-    const result = await pgPool.query(query, [chatJson, projectIdNum, headId]);  // Pass headId as $3
+
+    const result = await pgPool.query(query, [chatJson, projectIdNum, headId || null]);
 
     if (result.rowCount > 0) {
       const newIndex = result.rows[0][field].length - 1;
-      const msg = {
-  id: newIndex,
-  type,
-  data: msgData,
-  caption: data.caption || null,
-  timestamp: timestamp || new Date().toISOString(),
-  seen_by: [],
-  mention: mention || null,
-  replyTo: replyTo || null,
-  tempId,
-};
-      const room = `project_${projectId}`;
-      console.log(`📡 Head emit 'newMessage' to room ${room}`);
-      io.to(room).emit("newMessage", {
-        projectId,
-        fromRole: "head",
-        msg,
-      });
 
-      // Trigger push to client (remains the same)
-      const projectQuery = await pgPool.query('SELECT clientid FROM projectschema.clientproject WHERE project_id = $1', [projectIdNum]);
+      const msg = {
+        id: newIndex,
+        messageId,
+        type: storedType,
+        data: normalizedData,
+        caption: caption || data.caption || null,
+        timestamp: ts,
+        seen_by: [],
+        mention: mention || null,
+        replyTo: replyTo || null,
+        tempId,
+        fromRole: "head",
+        fromHead: true,
+      };
+
+      console.log("✅ Message saved to", field, "index:", newIndex, "messageId:", messageId);
+
+      emitChatToRoom(socket, projectId, "head", msg);
+
+      // Push notification
+      const projectQuery = await pgPool.query(
+        'SELECT clientid FROM projectschema.clientproject WHERE project_id = $1',
+        [projectIdNum]
+      );
       const clientId = projectQuery.rows[0]?.clientid;
-      if (clientId && !msg.seen_by.includes('client')) {
+
+      if (clientId) {
         const title = type === 'text' ? 'New Message from Head' : 'New File from Head';
-        const body = type === 'text' ? (typeof msgData === 'string' ? msgData.slice(0, 50) + '...' : (msgData.name || 'File')) : `File: ${msgData.name || 'Unknown'}`;
-        console.log(`🚀 Head push to client ${clientId}: ${title}`);
+        const body = type === 'text'
+          ? (typeof normalizedData === 'string' ? normalizedData.slice(0, 50) + '...' : 'File')
+          : `File: ${normalizedData?.name || 'Unknown'}`;
+
         await sendPushNotification(clientId.toString(), 'client', title, body, projectIdNum);
       }
     }
@@ -278,18 +363,41 @@ socket.on("sendTLMessage", async (data) => {
   try {
     const projectIdNum = Number(projectId);
     if (isNaN(projectIdNum)) return;
+    if (!claimTempId(projectIdNum, tempId)) return;
 
     const projectCheck = await pgPool.query(
-      "SELECT project_id FROM projectschema.clientproject WHERE project_id = $1",
+      "SELECT project_id, teamleaderid FROM projectschema.clientproject WHERE project_id = $1",
       [projectIdNum]
     );
     if (projectCheck.rows.length === 0) return;
 
-    const teamLeaderCheck = await pgPool.query(
-      'SELECT "employeeId" FROM "Entities".employees WHERE "employeeId" = $1 AND role = $2',
-      [teamleaderid, 'Team Leader']
-    );
-    if (teamLeaderCheck.rows.length === 0) return;
+    // Accept TL if they are a Team Leader employee OR assigned as this project's team leader.
+    // Silent drops here previously broke TL file chat from the landing page.
+    let resolvedTlId = teamleaderid;
+    if (resolvedTlId) {
+      const teamLeaderCheck = await pgPool.query(
+        `SELECT "employeeId" FROM "Entities".employees
+         WHERE "employeeId" = $1
+           AND (role = 'Team Leader' OR LOWER(COALESCE(role, '')) IN ('team leader', 'teamleader', 'tl'))`,
+        [resolvedTlId]
+      );
+      const isAssignedTl =
+        projectCheck.rows[0]?.teamleaderid != null &&
+        String(projectCheck.rows[0].teamleaderid) === String(resolvedTlId);
+      if (teamLeaderCheck.rows.length === 0 && !isAssignedTl) {
+        console.warn("sendTLMessage rejected: not a TL and not project assignee", {
+          teamleaderid: resolvedTlId,
+          projectId: projectIdNum,
+        });
+        return;
+      }
+    } else {
+      resolvedTlId = projectCheck.rows[0]?.teamleaderid || null;
+      if (!resolvedTlId) {
+        console.warn("sendTLMessage rejected: missing teamleaderid", { projectId: projectIdNum });
+        return;
+      }
+    }
 
     if (mention) {
       if (mention.type === 'client') {
@@ -309,44 +417,61 @@ socket.on("sendTLMessage", async (data) => {
       }
     }
 
+    // Normalize file payload so clients never receive null MIME types
+    let normalizedData = msgData;
+    if ((type === "file" || type === "audio") && msgData && typeof msgData === "object") {
+      normalizedData = {
+        ...msgData,
+        name: msgData.name || "File",
+        url: msgData.url || "",
+        type: msgData.type || (type === "audio" ? "audio/mpeg" : "application/octet-stream"),
+      };
+    }
+
+    const storedType = type === "audio" ? "file" : type;
+    const messageId = makeMessageId();
+    const ts = timestamp || new Date().toISOString();
     const chatJson = JSON.stringify({
-      type,
-      data: msgData,
+      type: storedType,
+      data: normalizedData,
       caption: data.caption || null,
-      timestamp,
+      timestamp: ts,
       seen_by: [],
       mention: mention || null,
-      replyTo: replyTo || null
+      replyTo: replyTo || null,
+      fromRole: "tl",
+      fromTeamLeader: true,
+      messageId,
+      tempId: tempId || null,
     });
 
-    const field = type === "audio" ? "tlaudios" : "tlchats";
+    const field = (type === "audio" || type === "file") ? "tlaudios" : "tlchats";
     const query = `
       UPDATE projectschema.clientproject
-      SET ${field} = array_append(${field}, $1),
-          teamleaderid = $3
+      SET ${field} = array_append(COALESCE(${field}, ARRAY[]::text[]), $1),
+          teamleaderid = COALESCE(teamleaderid, $3)
       WHERE project_id = $2
       RETURNING ${field}
     `;
-    const result = await pgPool.query(query, [chatJson, projectIdNum, teamleaderid]);
+    const result = await pgPool.query(query, [chatJson, projectIdNum, resolvedTlId]);
 
     if (result.rowCount > 0) {
       const newIndex = result.rows[0][field].length - 1;
       const msg = {
         id: newIndex,
-        type,
-        data: msgData,
+        messageId,
+        type: storedType,
+        data: normalizedData,
         caption: data.caption || null,
-        timestamp,
+        timestamp: ts,
         seen_by: [],
         mention: mention || null,
         replyTo: replyTo || null,
         tempId,
-      };
-      io.to(`project_${projectId}`).emit("newMessage", {
-        projectId,
         fromRole: "tl",
-        msg,
-      });
+        fromTeamLeader: true,
+      };
+      emitChatToRoom(socket, projectId, "tl", msg);
 
       // Existing: Trigger push to client
       const projectQuery = await pgPool.query('SELECT clientid FROM projectschema.clientproject WHERE project_id = $1', [projectIdNum]);
@@ -704,10 +829,12 @@ socket.on('sendMessage', async (data) => {
     );
     console.log(`💾 Saved to ${updateField} for project ${projectId}`);
 
-    // Emit to correct room (fix to underscore)
+    // Others get newMessage; sender should use dedicated role emits (sendHeadMessage etc.)
+    // Keep exclude-sender for this legacy path.
     const room = `project_${projectId}`;
     console.log(`📡 Emitting 'newMessage' to room ${room} (excluding sender)`);
     socket.to(room).emit('newMessage', { projectId, fromRole, msg: msgObj });
+    // Do not also emit to sender — avoids double bubbles if any client still uses sendMessage
 
     // TRIGGER PUSH
     let recipientId, recipientType, title, body;

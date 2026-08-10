@@ -6,9 +6,85 @@ var pgPool = require("./PostgreSQLPool");
 var {initializeDatabase2} = require("./init");
 var multer = require("multer");
 var path = require("path");
+
+const fs = require("fs");
+const fsp = fs.promises;
+const crypto = require("crypto");
+const os = require("os");
+
+const multipartParser = multer();
+const { verifyToken } = require("../middleware/auth");
+const jwt = require('jsonwebtoken');
+
+function normalizeUploaderRole(role) {
+  if (!role) return 'client';
+  const normalized = String(role).trim().toLowerCase();
+  if (normalized === 'head') return 'head';
+  if (normalized === 'team leader' || normalized === 'teamleader' || normalized === 'tl' || normalized === 'team_leader') return 'tl';
+  return 'client';
+}
+
+// Optional auth: if token present, decode and attach req.user; otherwise continue
+function tryAuth(req, res, next) {
+  let token = req.headers.authorization?.split(' ')[1];
+  if (!token) token = req.cookies?.accessToken;
+  if (!token) return next();
+  jwt.verify(token, process.env.JWT_ACCESS_TOKEN, (err, decoded) => {
+    if (!err && decoded) req.user = decoded;
+    return next();
+  });
+}
+
+// Final files go here
+const FINAL_FILES_DIR = path.join(__dirname, "..", "public", "files");
+
+// Temporary parts live only in the system temp folder (auto-cleaned by OS)
+const TMP_ROOT = path.join(os.tmpdir(), "pms_chunks");
+
+async function ensureDir(dir) {
+  await fsp.mkdir(dir, { recursive: true });
+}
+
 var upload = require("./multer");
-var webpush = require('web-push'); // Ensure imported
+var webpush = require('web-push');
 const nodemailer = require('nodemailer');
+
+const UPLOAD_TMP_ROOT = path.join(process.cwd(), "tmp_uploads");
+
+async function ensureDir(dir) {
+    await fsp.mkdir(dir, { recursive: true });
+}
+
+async function readMeta(uploadId) {
+    const raw = await fsp.readFile(
+        path.join(UPLOAD_TMP_ROOT, uploadId, "meta.json"),
+        "utf8"
+    );
+    return JSON.parse(raw);
+}
+
+async function writeMeta(uploadId, meta) {
+    await fsp.writeFile(
+        path.join(UPLOAD_TMP_ROOT, uploadId, "meta.json"),
+        JSON.stringify(meta)
+    );
+}
+
+async function receivedChunkIndices(uploadId) {
+    const dir = path.join(UPLOAD_TMP_ROOT, uploadId);
+
+    try {
+        const files = await fsp.readdir(dir);
+
+        return files
+            .filter(f => f.endsWith(".part"))
+            .map(f => Number(f.replace(".part", "")))
+            .sort((a,b)=>a-b);
+
+    } catch {
+        return [];
+    }
+}
 
 // Create transporter
 const transporter = nodemailer.createTransport({
@@ -1300,6 +1376,200 @@ router.post("/upload_file", upload.single("file"), function (req, res) {
   }
 });
 
+// ===================== 1. INIT =====================
+router.post(
+  "/upload_init",
+  express.json(),
+  express.urlencoded({ extended: true }),
+  tryAuth,
+  multipartParser.none(),
+  async (req, res) => {
+    try {
+      console.log('upload_init content-type:', req.headers['content-type']);
+      console.log('upload_init body:', req.body);
+      const { fileName, fileType, totalChunks, projectId } = req.body || {};
+
+      if (!fileName || !totalChunks) {
+        return res.status(400).json({ status: false, message: "Missing fields" });
+      }
+
+    const uploadId = crypto.randomUUID();
+    const tmpDir = path.join(TMP_ROOT, uploadId);
+    await ensureDir(tmpDir);
+    // Derive uploader info: prefer authenticated user, fall back to body fields
+    let derivedUploaderRole = null;
+    let derivedUploaderId = null;
+    if (req.user) {
+      derivedUploaderRole = normalizeUploaderRole(req.user.role || null);
+      derivedUploaderId = req.user.userId || req.user.userId || null;
+    }
+    // If auth is absent or cannot determine role, use explicit uploader values from the client
+    if (!derivedUploaderRole && req.body && req.body.uploaderRole) {
+      derivedUploaderRole = normalizeUploaderRole(req.body.uploaderRole);
+    }
+    if (!derivedUploaderId && req.body && req.body.uploaderId) {
+      derivedUploaderId = req.body.uploaderId;
+    }
+
+    console.log('upload_init uploaderRole:', derivedUploaderRole, 'uploaderId:', derivedUploaderId, 'authPresent:', !!req.user);
+
+    await fsp.writeFile(
+      path.join(tmpDir, "meta.json"),
+      JSON.stringify({
+        fileName,
+        fileType: fileType || "application/octet-stream",
+        totalChunks: Number(totalChunks),
+        projectId,
+        uploaderRole: derivedUploaderRole || 'client',
+        uploaderId: derivedUploaderId || null,
+        caption: req.body.caption || null,
+        createdAt: Date.now(),
+      })
+    );
+
+    return res.json({ status: true, uploadId });
+  } catch (err) {
+    console.error("upload_init error:", err);
+    return res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+
+// ===================== 2. CHUNK =====================
+// Special multer that writes only .part files into system temp
+const chunkStorage = multer.diskStorage({
+  destination: async (req, file, cb) => {
+    try {
+      const uploadId = req.body.uploadId;
+      const dir = path.join(TMP_ROOT, uploadId);
+      await ensureDir(dir);
+      cb(null, dir);
+    } catch (e) {
+      cb(e);
+    }
+  },
+  filename: (req, file, cb) => {
+    const index = req.body.chunkIndex;
+    cb(null, `${index}.part`);
+  },
+});
+
+const uploadChunk = multer({ storage: chunkStorage });
+
+router.post("/upload_chunk", uploadChunk.single("chunk"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ status: false, message: "No chunk received" });
+    }
+    return res.json({ status: true });
+  } catch (err) {
+    console.error("upload_chunk error:", err);
+    return res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+
+// ===================== 3. COMPLETE =====================
+// Accept JSON (axios default) and multipart form bodies
+router.post(
+  "/upload_complete",
+  express.json(),
+  express.urlencoded({ extended: true }),
+  multipartParser.none(),
+  async (req, res) => {
+  console.log("upload_complete body:", req.body);
+
+  try {
+    const { uploadId } = req.body || {};
+    if (!uploadId) {
+      return res.status(400).json({ status: false, message: "uploadId required" });
+    }
+
+    const tmpDir = path.join(TMP_ROOT, uploadId);
+    const metaPath = path.join(tmpDir, "meta.json");
+
+    if (!fs.existsSync(metaPath)) {
+      return res.status(404).json({ status: false, message: "Upload session not found" });
+    }
+
+    const meta = JSON.parse(await fsp.readFile(metaPath, "utf8"));
+    const total = meta.totalChunks;
+
+    // Check all parts exist
+    for (let i = 0; i < total; i++) {
+      const part = path.join(tmpDir, `${i}.part`);
+      if (!fs.existsSync(part)) {
+        return res.status(400).json({
+          status: false,
+          message: `Missing chunk ${i}`,
+        });
+      }
+    }
+
+    // Final file name
+    const ext = path.extname(meta.fileName) || "";
+    const safeName = `${crypto.randomUUID()}${ext}`;
+    const finalPath = path.join(FINAL_FILES_DIR, safeName);
+
+    await ensureDir(FINAL_FILES_DIR);
+    console.log('upload_complete finalPath:', finalPath);
+
+    // Assemble all parts into one file in public/files
+    const writeStream = fs.createWriteStream(finalPath);
+
+    for (let i = 0; i < total; i++) {
+      const partPath = path.join(tmpDir, `${i}.part`);
+      const data = await fsp.readFile(partPath);
+      writeStream.write(data);
+    }
+
+    await new Promise((resolve, reject) => {
+      writeStream.end();
+      writeStream.on("finish", resolve);
+      writeStream.on("error", reject);
+    });
+
+    const fileUrl = `/files/${safeName}`;
+
+    // NOTE: Do NOT persist chat / emit socket here.
+    // Chat persistence + realtime broadcast must happen once via socket handlers
+    // (sendHeadMessage / sendClientMessage / sendTLMessage) after the client
+    // receives this response. Saving here caused duplicate messages and broken
+    // image previews (relative URL + second socket event without tempId).
+
+    // Clean up temporary parts
+    await fsp.rm(tmpDir, { recursive: true, force: true });
+
+    return res.json({
+      status: true,
+      fileUrl,
+      fileName: meta.fileName,
+      fileType: meta.fileType || "application/octet-stream",
+      projectId: meta.projectId || null,
+      uploaderRole: normalizeUploaderRole(meta.uploaderRole || "client"),
+      uploaderId: meta.uploaderId || null,
+      caption: meta.caption || null,
+    });
+  } catch (err) {
+    console.error("upload_complete error:", err);
+    return res.status(500).json({ status: false, message: err.message });
+  }
+});
+
+
+// Optional cancel
+router.post("/upload_cancel", async (req, res) => {
+  try {
+    const { uploadId } = req.body;
+    if (uploadId) {
+      await fsp.rm(path.join(TMP_ROOT, uploadId), { recursive: true, force: true });
+    }
+    return res.json({ status: true });
+  } catch (err) {
+    return res.status(500).json({ status: false, message: err.message });
+  }
+});
+
 // Get client projects
 router.get("/get_client_projects/:clientId", function (req, res) {
   const { clientId } = req.params;
@@ -2496,93 +2766,11 @@ router.post('/update_progress/:projectId', async (req, res) => {
   }
 });
 
+// Keep a reference to the Socket.IO server so other helpers can emit if needed.
+// Message handlers live in socket/index.js only — do not re-register them here
+// or every client event will be handled twice (duplicate chat rows).
 module.exports.attachIo = (ioInstance) => {
   io = ioInstance;
-
-  io.on('connection', (socket) => {
-    console.log('🔌 Socket connected:', socket.id);
-
-    // ==================== CLIENT MESSAGE HANDLER (FIX) ====================
-    socket.on("sendClientMessage", async (data) => {
-      const { 
-        projectId, 
-        type,           // "text" | "file" | "audio"
-        msgData, 
-        timestamp, 
-        mention = null, 
-        tempId,
-        replyTo = null,
-        caption = null 
-      } = data;
-
-      console.log(`📨 [sendClientMessage] project=${projectId}, type=${type}`);
-
-      try {
-        const projectIdNum = Number(projectId);
-        if (isNaN(projectIdNum)) return;
-
-        // Check project exists
-        const projCheck = await pgPool.query(
-          "SELECT project_id FROM projectschema.clientproject WHERE project_id = $1",
-          [projectIdNum]
-        );
-        if (projCheck.rows.length === 0) return;
-
-        const column = (type === "audio" || type === "file") ? "clientaudios" : "clientchats";
-
-        const chatObj = {
-          type: type === "audio" ? "file" : type,
-          data: msgData,
-          timestamp: timestamp || new Date().toISOString(),
-          seen_by: [],
-          mention: mention || null,
-          replyTo: replyTo || null,
-          caption: caption || null
-        };
-
-        const jsonStr = JSON.stringify(chatObj);
-
-        await pgPool.query(
-          `UPDATE projectschema.clientproject 
-           SET ${column} = array_append(COALESCE(${column}, ARRAY[]::text[]), $1)
-           WHERE project_id = $2`,
-          [jsonStr, projectIdNum]
-        );
-
-        // Get new index
-        const idxResult = await pgPool.query(
-          `SELECT array_length(${column}, 1) as len FROM projectschema.clientproject WHERE project_id = $1`,
-          [projectIdNum]
-        );
-        const newIndex = (idxResult.rows[0]?.len || 1) - 1;
-
-        const msgToEmit = {
-          id: newIndex,
-          type: type === "audio" ? "file" : type,
-          data: msgData,
-          timestamp: chatObj.timestamp,
-          seen_by: [],
-          mention: mention || null,
-          replyTo: replyTo || null,
-          caption: caption || null,
-          tempId
-        };
-
-        // Emit to project room (this upgrades the optimistic message)
-        io.to(`project_${projectIdNum}`).emit("newMessage", {
-          fromRole: "client",
-          msg: msgToEmit
-        });
-
-      } catch (err) {
-        console.error("sendClientMessage error:", err);
-      }
-    });
-
-    socket.on('disconnect', () => {
-      console.log('🔌 Socket disconnected:', socket.id);
-    });
-  });
 };
 
 // ==================== OFFICIAL PROJECT ASSIGNED EMAIL (Exact match to your save_project style) ====================
@@ -2633,6 +2821,38 @@ const sendAssignmentEmail = async (employeeMail, employeeName, projectTitle, wor
   }
 };
 
+async function sweepStaleUploads(maxAgeMs = 24 * 60 * 60 * 1000) {
+
+    const sessions = await fsp
+        .readdir(UPLOAD_TMP_ROOT)
+        .catch(() => []);
+
+    for (const id of sessions) {
+
+        try {
+
+            const meta = await readMeta(id);
+
+            if (
+                meta.createdAt &&
+                Date.now() - new Date(meta.createdAt).getTime() > maxAgeMs
+            ) {
+
+                await fsp.rm(
+                    path.join(UPLOAD_TMP_ROOT, id),
+                    {
+                        recursive: true,
+                        force: true
+                    }
+                );
+
+            }
+
+        } catch {}
+
+    }
+
+}
 
 module.exports = router;
 module.exports.sendPushNotification = sendPushNotification;
