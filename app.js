@@ -76,17 +76,22 @@ app.use((req, res, next) => {
   const origin = req.headers.origin;
   const isLocalOrigin =
     origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
-  const isLocalHost =
-    String(process.env.PG_HOST || 'localhost').toLowerCase() === 'localhost' ||
-    String(process.env.PG_SSL || '').toLowerCase() === 'false';
+  // Production frontend must always be allowed (do not gate on PG_SSL)
+  let isCognicodeHost = false;
+  try {
+    if (origin) {
+      isCognicodeHost = /cognicodeedutech\.com$/i.test(new URL(origin).hostname);
+    }
+  } catch (_) {
+    isCognicodeHost = false;
+  }
+  const isAllowed =
+    !origin ||
+    isLocalOrigin ||
+    allowedOrigins.has(origin) ||
+    isCognicodeHost;
 
-  if (origin && (isLocalHost || isLocalOrigin || allowedOrigins.has(origin))) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-  } else if (!origin) {
-    // non-browser
-  } else if (isLocalHost) {
-    // local API: reflect any origin
+  if (origin && isAllowed) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   }
@@ -97,7 +102,6 @@ app.use((req, res, next) => {
     'GET,POST,PUT,DELETE,OPTIONS,PATCH,HEAD'
   );
 
-  // Reflect requested headers OR allow admin headers explicitly
   const requested = req.headers['access-control-request-headers'];
   res.setHeader(
     'Access-Control-Allow-Headers',

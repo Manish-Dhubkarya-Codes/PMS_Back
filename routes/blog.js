@@ -66,13 +66,34 @@ const upload = multer({
 });
 
 // ======================================================
-// DB INIT
+// DB INIT (works on local Postgres + Hostinger managed PG)
+// Sequential statements so one failure is easy to diagnose.
 // ======================================================
 
-async function initializeBlogDB() {
+async function runSql(label, sql, params) {
   try {
-    await cognicodePool.query(`
-      CREATE TABLE IF NOT EXISTS blog_categories (
+    await cognicodePool.query(sql, params);
+    console.log(`  ✔ ${label}`);
+  } catch (err) {
+    console.error(`  ✖ ${label}:`, err.message);
+    throw err;
+  }
+}
+
+async function initializeBlogDB() {
+  console.log("⏳ Blog DB init starting…");
+  try {
+    // Prove connection first
+    const ping = await cognicodePool.query(
+      "SELECT current_database() AS db, current_user AS usr"
+    );
+    console.log(
+      `  → connected as ${ping.rows[0].usr} on database ${ping.rows[0].db}`
+    );
+
+    await runSql(
+      "blog_categories",
+      `CREATE TABLE IF NOT EXISTS blog_categories (
         id SERIAL PRIMARY KEY,
         name VARCHAR(120) NOT NULL,
         slug VARCHAR(140) NOT NULL UNIQUE,
@@ -80,9 +101,12 @@ async function initializeBlogDB() {
         service_href VARCHAR(255),
         service_label VARCHAR(160),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+      )`
+    );
 
-      CREATE TABLE IF NOT EXISTS blog_posts (
+    await runSql(
+      "blog_posts",
+      `CREATE TABLE IF NOT EXISTS blog_posts (
         id SERIAL PRIMARY KEY,
         slug VARCHAR(220) NOT NULL UNIQUE,
         title VARCHAR(320) NOT NULL,
@@ -90,13 +114,16 @@ async function initializeBlogDB() {
         meta_description TEXT,
         content JSONB DEFAULT '[]'::jsonb,
         key_takeaways JSONB DEFAULT '[]'::jsonb,
-        category_slug VARCHAR(140) REFERENCES blog_categories(slug) ON UPDATE CASCADE ON DELETE SET NULL,
+        category_slug VARCHAR(140),
         author_name VARCHAR(160),
         author_role VARCHAR(160),
         author_bio TEXT,
         author_initials VARCHAR(8),
         cover_image TEXT,
         cover_video TEXT,
+        youtube_url TEXT,
+        media_gallery JSONB DEFAULT '[]'::jsonb,
+        likes INTEGER DEFAULT 0,
         image_label VARCHAR(120),
         image_gradient VARCHAR(255),
         keywords JSONB DEFAULT '[]'::jsonb,
@@ -110,9 +137,33 @@ async function initializeBlogDB() {
         updated_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+      )`
+    );
 
-      CREATE TABLE IF NOT EXISTS blog_media (
+    // Soft FK after both tables exist (avoids order issues on some hosts)
+    try {
+      await cognicodePool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'blog_posts_category_slug_fkey'
+          ) THEN
+            ALTER TABLE blog_posts
+              ADD CONSTRAINT blog_posts_category_slug_fkey
+              FOREIGN KEY (category_slug)
+              REFERENCES blog_categories(slug)
+              ON UPDATE CASCADE ON DELETE SET NULL;
+          END IF;
+        END $$;
+      `);
+      console.log("  ✔ blog_posts → blog_categories FK");
+    } catch (e) {
+      console.warn("  ⚠ category FK skipped:", e.message);
+    }
+
+    await runSql(
+      "blog_media",
+      `CREATE TABLE IF NOT EXISTS blog_media (
         id SERIAL PRIMARY KEY,
         filename VARCHAR(255) NOT NULL,
         original_name VARCHAR(255),
@@ -122,11 +173,14 @@ async function initializeBlogDB() {
         url TEXT NOT NULL,
         alt_text TEXT,
         uploaded_by INTEGER,
-        post_id INTEGER REFERENCES blog_posts(id) ON DELETE SET NULL,
+        post_id INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+      )`
+    );
 
-      CREATE TABLE IF NOT EXISTS blog_resources (
+    await runSql(
+      "blog_resources",
+      `CREATE TABLE IF NOT EXISTS blog_resources (
         id SERIAL PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
         description TEXT,
@@ -135,30 +189,55 @@ async function initializeBlogDB() {
         file_url TEXT,
         is_active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+      )`
+    );
 
-      CREATE TABLE IF NOT EXISTS blog_subscribers (
+    await runSql(
+      "blog_subscribers",
+      `CREATE TABLE IF NOT EXISTS blog_subscribers (
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) NOT NULL UNIQUE,
         source VARCHAR(120),
         is_active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+      )`
+    );
 
-      CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
-      CREATE INDEX IF NOT EXISTS idx_blog_posts_category ON blog_posts(category_slug);
-      CREATE INDEX IF NOT EXISTS idx_blog_posts_featured ON blog_posts(featured);
-      CREATE INDEX IF NOT EXISTS idx_blog_media_type ON blog_media(media_type);
-    `);
+    // Additive columns for DBs created before social fields existed
+    const alters = [
+      ["youtube_url", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS youtube_url TEXT"],
+      ["media_gallery", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS media_gallery JSONB DEFAULT '[]'::jsonb"],
+      ["likes", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS likes INTEGER DEFAULT 0"],
+    ];
+    for (const [label, sql] of alters) {
+      try {
+        await cognicodePool.query(sql);
+        console.log(`  ✔ alter ${label}`);
+      } catch (e) {
+        console.warn(`  ⚠ alter ${label}:`, e.message);
+      }
+    }
 
-    // Additive columns for social-style posts (safe on existing DBs)
-    await cognicodePool.query(`
-      ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS youtube_url TEXT;
-      ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS media_gallery JSONB DEFAULT '[]'::jsonb;
-      ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS likes INTEGER DEFAULT 0;
-    `);
+    await runSql(
+      "indexes",
+      `CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
+       CREATE INDEX IF NOT EXISTS idx_blog_posts_category ON blog_posts(category_slug);
+       CREATE INDEX IF NOT EXISTS idx_blog_posts_featured ON blog_posts(featured);
+       CREATE INDEX IF NOT EXISTS idx_blog_media_type ON blog_media(media_type)`
+    );
 
-    // Seed default categories if empty
+    // Also ensure admindetails exists on Cognicode DB (login for website admin)
+    await runSql(
+      "admindetails",
+      `CREATE TABLE IF NOT EXISTS "admindetails" (
+        "adminId" SERIAL PRIMARY KEY,
+        "name" VARCHAR(100) NOT NULL,
+        "email" VARCHAR(150) UNIQUE NOT NULL,
+        "password" TEXT NOT NULL,
+        "updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
+    );
+
     const { rows } = await cognicodePool.query(
       `SELECT COUNT(*)::int AS count FROM blog_categories`
     );
@@ -179,15 +258,24 @@ async function initializeBlogDB() {
           row
         );
       }
+      console.log("  ✔ seeded blog categories");
     }
 
-    console.log("✅ Blog tables initialized");
+    console.log("✅ Blog tables initialized successfully");
+    return { success: true };
   } catch (error) {
     console.error("❌ Blog DB init failed:", error.message);
+    console.error(
+      "   Fix Hostinger env: PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_COGNICODE_DATABASE, PG_SSL=true"
+    );
+    return { success: false, message: error.message };
   }
 }
 
-initializeBlogDB();
+// Auto-init on boot (with short delay so pool can connect on slow hosts)
+setTimeout(() => {
+  initializeBlogDB();
+}, 500);
 
 // ======================================================
 // HELPERS
@@ -969,4 +1057,66 @@ router.get("/admin/subscribers", verifyAdmin, async (_req, res) => {
   }
 });
 
+/**
+ * Public health — shows whether blog tables exist on this database.
+ * GET /blog/health
+ */
+router.get("/health", async (_req, res) => {
+  try {
+    const db = await cognicodePool.query(
+      "SELECT current_database() AS db, current_user AS usr"
+    );
+    const tables = await cognicodePool.query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name LIKE 'blog_%'
+      ORDER BY table_name
+    `);
+    const names = tables.rows.map((r) => r.table_name);
+    res.json({
+      success: true,
+      database: db.rows[0].db,
+      user: db.rows[0].usr,
+      tables: names,
+      ready: names.includes("blog_posts") && names.includes("blog_categories"),
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      hint: "Check PG_* env on Hostinger and run POST /blog/admin/init-tables",
+    });
+  }
+});
+
+/**
+ * Admin: force re-create blog tables (safe CREATE IF NOT EXISTS).
+ * POST /blog/admin/init-tables?adminId=&email=
+ */
+router.post("/admin/init-tables", verifyAdmin, async (_req, res) => {
+  const result = await initializeBlogDB();
+  if (!result?.success) {
+    return res.status(500).json({
+      success: false,
+      message: result?.message || "Init failed",
+    });
+  }
+  try {
+    const tables = await cognicodePool.query(`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name LIKE 'blog_%'
+      ORDER BY table_name
+    `);
+    res.json({
+      success: true,
+      message: "Blog tables ensured",
+      tables: tables.rows.map((r) => r.table_name),
+    });
+  } catch (e) {
+    res.json({ success: true, message: "Init ran", tables: [] });
+  }
+});
+
 module.exports = router;
+module.exports.initializeBlogDB = initializeBlogDB;
