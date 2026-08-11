@@ -20,6 +20,7 @@ var clientProjectRouter = require('./routes/clientproject');
 var teamLeaderRouter = require('./routes/teamleader');
 var clientRequestsRouter = require('./routes/clientrequests');
 var cognicodeAdminRouter = require('./routes/cogniadmin');
+var blogRouter = require('./routes/blog');
 
 const { handleJwtError } = require('./middleware/auth');
 const socket = require('./socket/index');
@@ -45,49 +46,69 @@ var server = http.createServer(app);
 
 
 // ======================================================
-// SIMPLE & STABLE CORS FIX
+// CORS — FIRST middleware, handles ALL preflights
 // ======================================================
 
-app.use((req, res, next) => {
-
-const allowedOrigins = [
+const allowedOrigins = new Set([
   'https://cognicodeedutech.com',
   'https://www.cognicodeedutech.com',
   'https://api.cognicodeedutech.com',
-  "https://ccitpms.com",
-
+  'https://ccitpms.com',
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:4000',
+  'http://localhost:4001',
   'http://localhost:5173',
   'http://localhost:5174',
-  'http://localhost:4000',
-
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  'http://127.0.0.1:4000',
+  'http://127.0.0.1:4001',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
   'http://187.77.184.39:5173',
   'http://187.77.184.39:5174',
-
   'https://cogni-code-project-management.vercel.app',
-  'https://cogni-code-website.vercel.app'
-];
-  const origin = req.headers.origin;
+  'https://cogni-code-website.vercel.app',
+]);
 
-  if (allowedOrigins.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const isLocalOrigin =
+    origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+  const isLocalHost =
+    String(process.env.PG_HOST || 'localhost').toLowerCase() === 'localhost' ||
+    String(process.env.PG_SSL || '').toLowerCase() === 'false';
+
+  if (origin && (isLocalHost || isLocalOrigin || allowedOrigins.has(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  } else if (!origin) {
+    // non-browser
+  } else if (isLocalHost) {
+    // local API: reflect any origin
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
   }
 
-  res.header(
-    'Access-Control-Allow-Headers',
-    'Origin, X-Requested-With, Content-Type, Accept, Authorization'
-  );
-
-  res.header(
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader(
     'Access-Control-Allow-Methods',
-    'GET, POST, PUT, DELETE, OPTIONS'
+    'GET,POST,PUT,DELETE,OPTIONS,PATCH,HEAD'
   );
 
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // Reflect requested headers OR allow admin headers explicitly
+  const requested = req.headers['access-control-request-headers'];
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    requested ||
+      'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-admin-id, x-admin-email, X-Admin-Id, X-Admin-Email'
+  );
+  res.setHeader('Access-Control-Max-Age', '86400');
 
   if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
+    return res.status(204).end();
   }
-
   next();
 });
 
@@ -184,6 +205,7 @@ app.use('/clientproject', clientProjectRouter);
 app.use('/teamleader', teamLeaderRouter);
 app.use('/clientrequests', clientRequestsRouter);
 app.use('/cogniadmin', cognicodeAdminRouter);
+app.use('/blog', blogRouter);
 
 
 
