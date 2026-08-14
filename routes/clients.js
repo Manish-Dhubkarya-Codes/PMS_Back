@@ -3,7 +3,7 @@ var router = express.Router();
 var pgPool = require("./PostgreSQLPool");
 var upload = require("./multer");
 const bcrypt = require('bcrypt');
-const { verifyToken } = require('../middleware/auth');
+const { verifyToken, setAuthCookies, clearAuthCookies, loginTokenResponse, handleTokenRefresh } = require('../middleware/auth');
 require('dotenv').config(); // Load environment variables
 const jwt = require("jsonwebtoken");
 const JWT_ACCESS_TOKEN = process.env.JWT_ACCESS_TOKEN;
@@ -476,36 +476,13 @@ router.post('/check_login_client', async function (req, res) {
           JWT_REFRESH_TOKEN,
           { expiresIn: "7d" }
         );
-        // Set both tokens as HttpOnly cookies
-        res.cookie("accessToken", accessToken, {
-  httpOnly: true,
-  secure: true, // Set to true in production (requires HTTPS)
-  sameSite: "none",
-  path: "/",
-  maxAge: 15 * 60 * 1000,
-});
+        setAuthCookies(res, accessToken, refreshToken);
 
-res.cookie("refreshToken", refreshToken, {
-  httpOnly: true,
-  secure: true,
-  sameSite: "none",
-  path: "/",
-  maxAge: 7 * 24 * 60 * 60 * 1000,
-});
-
-        // Decode exps to send in response (client stores these for timers)
-        const decodedAccess = jwt.decode(accessToken);
-        const accessExp = decodedAccess.exp * 1000;
-        const decodedRefresh = jwt.decode(refreshToken);
-        const refreshExp = decodedRefresh.exp * 1000;
-
-        // Return user data and exps in body (do not send tokens in body for security)
         return res.status(200).json({
           status: true,
           message: "Login successful!",
           data: user,
-          accessExp,
-          refreshExp,
+          ...loginTokenResponse(accessToken, refreshToken),
         });
       }
     });
@@ -516,73 +493,11 @@ res.cookie("refreshToken", refreshToken, {
   }
 });
 
-router.post('/refresh', (req, res) => {
-  const refreshToken = req.cookies.refreshToken;
-  console.log('Refresh request - Refresh token:', refreshToken ? 'Found' : 'Not found');  // DEBUG
-
-  if (!refreshToken) {
-    console.log('No refresh token in cookies');
-    return res.status(401).json({ status: false, message: 'No refresh token' });
-  }
-
-  try {
-    const decoded = jwt.verify(refreshToken, JWT_REFRESH_TOKEN);
-    console.log('Refresh token decoded:', decoded.userId);  // DEBUG
-
-    const newAccessToken = jwt.sign(
-      { userId: decoded.userId, role: decoded.role, name: decoded.name },
-      JWT_ACCESS_TOKEN,
-      { expiresIn: '15m' }
-    );
-
-    // Rotate refresh token: Generate new one
-    const newRefreshToken = jwt.sign(
-      { userId: decoded.userId, role: decoded.role, name: decoded.name },
-      JWT_REFRESH_TOKEN,
-      { expiresIn: '7d' }
-    );
-
-    // Set new access and refresh cookies
-    res.cookie("accessToken", accessToken, {
-  httpOnly: true,
-  secure: true,
-  sameSite: "none",
-  path: "/",
-  maxAge: 15 * 60 * 1000,
-});
-
-res.cookie("refreshToken", refreshToken, {
-  httpOnly: true,
-  secure: true,
-  sameSite: "none",
-  path: "/",
-  maxAge: 7 * 24 * 60 * 60 * 1000,
-});
-    // Decode exps to send in response
-    const decodedAccess = jwt.decode(newAccessToken);
-    const accessExp = decodedAccess.exp * 1000;
-    const decodedRefresh = jwt.decode(newRefreshToken);
-    const refreshExp = decodedRefresh.exp * 1000;
-
-    console.log('New access token and refresh token set');
-    return res.status(200).json({ 
-      status: true, 
-      message: 'Token refreshed',
-      accessExp,
-      refreshExp,
-    });
-  } catch (err) {
-    console.error('Refresh token verification failed:', err.message);
-    res.clearCookie('accessToken');
-    res.clearCookie('refreshToken');
-    return res.status(403).json({ status: false, message: 'Invalid refresh token' });
-  }
-});
+router.post('/refresh', handleTokenRefresh);
 
 // New logout endpoint to clear cookies
 router.post('/logout', (req, res) => {
-  res.clearCookie('accessToken');
-  res.clearCookie('refreshToken');
+  clearAuthCookies(res);
   return res.status(200).json({ status: true, message: 'Logged out successfully' });
 });
 
