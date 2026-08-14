@@ -462,6 +462,7 @@ if (io) {
     request_id: newRequestData.request_id,
     project_id: String(newRequestData.project_id),
     employeeId: newRequestData.employeeid,                 // camelCase for frontend
+    employeeid: newRequestData.employeeid,
     status: newRequestData.status || "pending",
     workstream: newRequestData.workstream,
     title: newRequestData.title,
@@ -516,18 +517,11 @@ router.get("/employee_requests", async function (req, res) {
       ORDER BY er.created_at DESC;
     `;
     const result = await pgPool.query(query);
-    
-    const requestsData = result.rows;
-
-    // Optional: Emit to connected clients (e.g., Tls) for real-time sync
-    if (io) {
-      io.to('tl').emit('allRequestsUpdate', { data: requestsData });
-    }
 
     return res.status(200).json({
       status: true,
       message: "Employee requests retrieved successfully!",
-      data: requestsData,
+      data: result.rows,
     });
   } catch (e) {
     console.error("Server Error:", e);
@@ -611,18 +605,11 @@ router.get("/project_request_status/:employeeId", async function (req, res) {
       ORDER BY er.created_at DESC;
     `;
     const result = await pgPool.query(query, [employeeId]);
-    
-    const employeeRequestsData = result.rows;
-
-    // Optional: Emit to specific employee for immediate sync (if per-user rooms exist)
-    if (io) {
-      io.to(`employee_${employeeId}`).emit('employeeRequestsUpdate', { data: employeeRequestsData });
-    }
 
     return res.status(200).json({
       status: true,
       message: "Employee requests retrieved successfully!",
-      data: employeeRequestsData,
+      data: result.rows,
     });
   } catch (e) {
     console.error("Server Error:", e);
@@ -1360,14 +1347,29 @@ router.post("/add_head_audio/:projectId", async function (req, res) {
 
 
 // Upload file
-router.post("/upload_file", upload.single("file"), function (req, res) {
-  console.log("File Upload:", req);
+router.post("/upload_file", (req, res, next) => {
+  upload.single("file")(req, res, (err) => {
+    if (err) {
+      console.error("Multer upload error:", err);
+      return res.status(400).json({ status: false, message: err.message || "File upload failed." });
+    }
+    next();
+  });
+}, function (req, res) {
   try {
     const file = req.file;
+    console.log("File Upload:", {
+      hasFile: !!file,
+      originalname: file?.originalname,
+      filename: file?.filename,
+      mimetype: file?.mimetype,
+      size: file?.size,
+      projectId: req.body?.projectId,
+      contentType: req.headers["content-type"],
+    });
     if (!file) {
       return res.status(400).json({ status: false, message: "No file uploaded." });
     }
-    const projectId = req.body.projectId;
     const fileUrl = `/files/${file.filename}`;
     return res.status(200).json({ status: true, data: { fileUrl } });
   } catch (e) {
@@ -1746,18 +1748,22 @@ router.post("/update_project_status/:projectId", async (req, res) => {
     }
 
     if (io) {
-  // For Employees / Team Leaders
-  io.to("employees").emit("projectStatusUpdated", {
-    projectId: projectId,
-    status: status
-  });
-
-  // For Client + Head + anyone who joined the project room
-  io.to(`project_${projectId}`).emit("projectStatusUpdated", {
-    projectId: projectId,
-    status: status
-  });
-}
+      const statusPayload = {
+        projectId: String(projectId),
+        project_id: String(projectId),
+        status,
+        active_date: result.rows[0]?.active_date || null,
+      };
+      // Broadcast to every role room so landing tabs update without a refresh
+      io.to("employees").emit("projectStatusUpdated", statusPayload);
+      io.to("tl").emit("projectStatusUpdated", statusPayload);
+      io.to("head").emit("projectStatusUpdated", statusPayload);
+      io.to(`project_${projectId}`).emit("projectStatusUpdated", statusPayload);
+      // Legacy alias still used by some landing pages
+      io.to("employees").emit("projectStatusUpdate", statusPayload);
+      io.to("tl").emit("projectStatusUpdate", statusPayload);
+      io.to("head").emit("projectStatusUpdate", statusPayload);
+    }
 
     return res.status(200).json({
       status: true,
@@ -1822,12 +1828,6 @@ router.post("/mark_message_seen/:projectId", async (req, res) => {
       [messages, projectId]
     );
 
-    if (io) {
-  io.to("head").emit("projectStatusUpdated", {
-    project_id: projectId,
-    status: "Active"
-  });
-}
     // Emit with timestamp for live update
     if (io) {
       io.to(`project_${projectId}`).emit("messageSeen", {

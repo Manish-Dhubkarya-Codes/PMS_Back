@@ -90,16 +90,33 @@ CREATE TABLE IF NOT EXISTS "Entities"."clients" (
       CREATE INDEX IF NOT EXISTS idx_push_userid ON "Entities"."pushSubscriptions" ("userId");
     `);
 
-   const insertQuery = `
-      INSERT INTO "Entities".head 
-      ("headId", "headMail", "role")
-      VALUES ($1, $2, $3)
-      ON CONFLICT ("headId") DO NOTHING;
+    // Older DBs created headName as NOT NULL; CREATE TABLE IF NOT EXISTS
+    // will not change that. Drop the constraint so seed + OTP registration work.
+    await pgPool.query(`
+      ALTER TABLE "Entities".head
+        ALTER COLUMN "headName" DROP NOT NULL;
+    `).catch(() => {});
+
+    const insertQuery = `
+      INSERT INTO "Entities".head
+      ("headId", "headName", "headMail", "headMobile", "headSecurityKey", "role", "password")
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT ("headId") DO UPDATE SET
+        "headName" = COALESCE(NULLIF("Entities".head."headName", ''), EXCLUDED."headName"),
+        "headMail" = COALESCE(EXCLUDED."headMail", "Entities".head."headMail"),
+        "headMobile" = COALESCE("Entities".head."headMobile", EXCLUDED."headMobile"),
+        "headSecurityKey" = COALESCE("Entities".head."headSecurityKey", EXCLUDED."headSecurityKey"),
+        "role" = COALESCE(EXCLUDED."role", "Entities".head."role"),
+        "password" = COALESCE("Entities".head."password", EXCLUDED."password");
     `;
     const values = [
       process.env.HEAD_ID || 1,
+      process.env.HEAD_NAME || "Head",
       process.env.HEAD_MAIL,
-      process.env.HEAD_ROLE || 'Head'
+      process.env.HEAD_MOBILE || null,
+      process.env.HEAD_SECURITY_KEY || null,
+      process.env.HEAD_ROLE || "Head",
+      process.env.HEAD_PASSWORD || null,
     ];
     await pgPool.query(insertQuery, values);
 

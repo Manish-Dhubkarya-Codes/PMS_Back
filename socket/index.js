@@ -55,9 +55,28 @@ module.exports = (io) => {
     console.log("User connected:", socket.id);
 
     socket.on("joinProject", (projectId) => {
+      if (projectId == null || projectId === "") return;
       const room = `project_${projectId}`;
       socket.join(room);
       console.log(`User ${socket.id} joined room: ${room}`);
+    });
+
+    socket.on("leaveProject", (projectId) => {
+      if (projectId == null || projectId === "") return;
+      socket.leave(`project_${projectId}`);
+    });
+
+    // Alias used by Technical TL landing to join employee monitor rooms
+    socket.on("joinTlMonitorRoom", (projectId) => {
+      if (projectId == null || projectId === "") return;
+      const room = `tl_monitor_${projectId}`;
+      socket.join(room);
+      console.log(`User ${socket.id} joined monitor room: ${room}`);
+    });
+
+    socket.on("leaveTlMonitorRoom", (projectId) => {
+      if (projectId == null || projectId === "") return;
+      socket.leave(`tl_monitor_${projectId}`);
     });
 
     // New: Join global head room for employee reg updates
@@ -655,8 +674,12 @@ socket.on("sendEmployeeMessage", async (data) => {
     const assignedResult = await pgPool.query(assignedQuery, [projectIdNum]);
     const assignedEmployees = assignedResult.rows.map((row) => row.employeeid_str);
 
-    if (!assignedEmployees.includes(String(senderId))) {
-      console.log(`❌ Employee ${senderId} not assigned to project ${projectId}`);
+    const senderKey = String(senderId ?? "");
+    const isAssigned = assignedEmployees.some(
+      (id) => String(id) === senderKey || String(id) === String(senderIdNum)
+    );
+    if (!isAssigned) {
+      console.log(`❌ Employee ${senderId} not assigned to project ${projectId}`, assignedEmployees);
       return;
     }
 
