@@ -271,9 +271,164 @@ const initializeAdminDB = async () => {
   }
 };
 
+let siteUsersInitPromise = null;
+
+const initializeSiteUsersDB = async () => {
+  if (siteUsersInitPromise) return siteUsersInitPromise;
+  siteUsersInitPromise = (async () => {
+  try {
+    await cognicodePool.query(`
+      CREATE TABLE IF NOT EXISTS "site_users" (
+        "userId" SERIAL PRIMARY KEY,
+        "username" VARCHAR(30) UNIQUE NOT NULL,
+        "displayName" VARCHAR(100),
+        "email" VARCHAR(150) UNIQUE,
+        "mobile" VARCHAR(20) UNIQUE,
+        "channel" VARCHAR(10) NOT NULL,
+        "countryCode" VARCHAR(8),
+        "isBlocked" BOOLEAN DEFAULT FALSE,
+        "blockedAt" TIMESTAMP,
+        "blockedReason" TEXT,
+        "lastLoginAt" TIMESTAMP,
+        "lastSeenAt" TIMESTAMP,
+        "loginCount" INTEGER DEFAULT 0,
+        "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        "updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS "site_user_otps" (
+        "id" SERIAL PRIMARY KEY,
+        "channel" VARCHAR(10) NOT NULL,
+        "destination" VARCHAR(150) NOT NULL,
+        "otpHash" TEXT NOT NULL,
+        "purpose" VARCHAR(20) NOT NULL,
+        "expiresAt" TIMESTAMP NOT NULL,
+        "attempts" INTEGER DEFAULT 0,
+        "consumed" BOOLEAN DEFAULT FALSE,
+        "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS "site_user_sessions" (
+        "sessionId" SERIAL PRIMARY KEY,
+        "userId" INTEGER REFERENCES "site_users"("userId") ON DELETE CASCADE,
+        "token" TEXT UNIQUE NOT NULL,
+        "userAgent" TEXT,
+        "ip" VARCHAR(64),
+        "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        "lastUsedAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS "blog_likes" (
+        "id" SERIAL PRIMARY KEY,
+        "userId" INTEGER REFERENCES "site_users"("userId") ON DELETE CASCADE,
+        "postSlug" VARCHAR(200) NOT NULL,
+        "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE ("userId", "postSlug")
+      );
+
+      CREATE TABLE IF NOT EXISTS "blog_comments" (
+        "id" SERIAL PRIMARY KEY,
+        "userId" INTEGER REFERENCES "site_users"("userId") ON DELETE CASCADE,
+        "postSlug" VARCHAR(200) NOT NULL,
+        "body" TEXT NOT NULL,
+        "parentId" INTEGER REFERENCES "blog_comments"("id") ON DELETE CASCADE,
+        "isPinned" BOOLEAN DEFAULT FALSE,
+        "isAdmin" BOOLEAN DEFAULT FALSE,
+        "adminId" INTEGER,
+        "adminName" VARCHAR(120),
+        "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        "updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS "blog_shares" (
+        "id" SERIAL PRIMARY KEY,
+        "userId" INTEGER REFERENCES "site_users"("userId") ON DELETE SET NULL,
+        "postSlug" VARCHAR(200) NOT NULL,
+        "channel" VARCHAR(40),
+        "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS "blog_visits" (
+        "id" SERIAL PRIMARY KEY,
+        "userId" INTEGER REFERENCES "site_users"("userId") ON DELETE SET NULL,
+        "postSlug" VARCHAR(200),
+        "path" TEXT,
+        "userAgent" TEXT,
+        "ip" VARCHAR(64),
+        "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_site_users_email ON "site_users" (email);
+      CREATE INDEX IF NOT EXISTS idx_site_users_mobile ON "site_users" (mobile);
+      CREATE INDEX IF NOT EXISTS idx_site_users_username ON "site_users" (LOWER(username));
+      CREATE INDEX IF NOT EXISTS idx_site_users_last_login ON "site_users" ("lastLoginAt" DESC);
+      CREATE INDEX IF NOT EXISTS idx_site_otps_dest ON "site_user_otps" (destination, consumed);
+      CREATE INDEX IF NOT EXISTS idx_site_sessions_token ON "site_user_sessions" (token);
+      CREATE INDEX IF NOT EXISTS idx_blog_likes_slug ON "blog_likes" ("postSlug");
+      CREATE INDEX IF NOT EXISTS idx_blog_comments_slug ON "blog_comments" ("postSlug", "created_at" DESC);
+      CREATE INDEX IF NOT EXISTS idx_blog_shares_slug ON "blog_shares" ("postSlug");
+      CREATE INDEX IF NOT EXISTS idx_blog_visits_slug ON "blog_visits" ("postSlug", "created_at" DESC);
+      CREATE INDEX IF NOT EXISTS idx_blog_visits_user ON "blog_visits" ("userId", "created_at" DESC);
+    `);
+
+    const commentAlters = [
+      `ALTER TABLE "site_users" ADD COLUMN IF NOT EXISTS "countryCode" VARCHAR(8)`,
+      `ALTER TABLE "site_users" ADD COLUMN IF NOT EXISTS "passwordHash" TEXT`,
+      `ALTER TABLE "blog_comments" ADD COLUMN IF NOT EXISTS "parentId" INTEGER REFERENCES "blog_comments"("id") ON DELETE CASCADE`,
+      `ALTER TABLE "blog_comments" ADD COLUMN IF NOT EXISTS "isPinned" BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE "blog_comments" ADD COLUMN IF NOT EXISTS "isAdmin" BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE "blog_comments" ADD COLUMN IF NOT EXISTS "adminId" INTEGER`,
+      `ALTER TABLE "blog_comments" ADD COLUMN IF NOT EXISTS "adminName" VARCHAR(120)`,
+      `ALTER TABLE "blog_likes" ALTER COLUMN "userId" DROP NOT NULL`,
+      `ALTER TABLE "blog_likes" ADD COLUMN IF NOT EXISTS "isAdmin" BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE "blog_likes" ADD COLUMN IF NOT EXISTS "adminId" INTEGER`,
+      `ALTER TABLE "blog_shares" ADD COLUMN IF NOT EXISTS "isAdmin" BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE "blog_shares" ADD COLUMN IF NOT EXISTS "adminId" INTEGER`,
+      `ALTER TABLE blog_subscribers ADD COLUMN IF NOT EXISTS "userId" INTEGER`,
+      `ALTER TABLE blog_subscribers ADD COLUMN IF NOT EXISTS name VARCHAR(120)`,
+    ];
+    for (const sql of commentAlters) {
+      try {
+        await cognicodePool.query(sql);
+      } catch (err) {
+        console.warn("site users alter skipped:", err.message);
+      }
+    }
+    await cognicodePool.query(
+      `CREATE INDEX IF NOT EXISTS idx_blog_comments_parent ON "blog_comments" ("parentId")`
+    );
+    await cognicodePool.query(`
+      CREATE TABLE IF NOT EXISTS "blog_saves" (
+        "id" SERIAL PRIMARY KEY,
+        "userId" INTEGER REFERENCES "site_users"("userId") ON DELETE CASCADE,
+        "adminId" INTEGER,
+        "postSlug" VARCHAR(200) NOT NULL,
+        "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await cognicodePool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_blog_likes_admin ON "blog_likes" ("adminId", "postSlug") WHERE "adminId" IS NOT NULL`
+    );
+    await cognicodePool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_blog_saves_user ON "blog_saves" ("userId", "postSlug") WHERE "userId" IS NOT NULL`
+    );
+    await cognicodePool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_blog_saves_admin ON "blog_saves" ("adminId", "postSlug") WHERE "adminId" IS NOT NULL`
+    );
+
+    console.log("✅ Site users + blog engagement tables initialized.");
+  } catch (error) {
+    console.error("❌ Site users DB initialization failed:", error);
+    siteUsersInitPromise = null;
+  }
+  })();
+  return siteUsersInitPromise;
+};
+
 module.exports = { 
   initializeDatabase1, 
   initializeDatabase2, 
   initializeClientRequestsDB,
-  initializeAdminDB  // ← Keep this
+  initializeAdminDB,
+  initializeSiteUsersDB
 };

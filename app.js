@@ -1,3 +1,24 @@
+require('dotenv').config();
+
+function logCrash(label, err) {
+  console.error(label, {
+    message: err && err.message,
+    code: err && err.code,
+    errno: err && err.errno,
+    syscall: err && err.syscall,
+    address: err && err.address,
+    port: err && err.port,
+    stack: err && err.stack,
+  });
+}
+
+process.on('uncaughtException', (err) => {
+  logCrash('❌ Uncaught exception:', err);
+});
+process.on('unhandledRejection', (err) => {
+  logCrash('❌ Unhandled rejection:', err);
+});
+
 var createError = require('http-errors');
 var express = require('express');
 var path = require('path');
@@ -21,6 +42,8 @@ var teamLeaderRouter = require('./routes/teamleader');
 var clientRequestsRouter = require('./routes/clientrequests');
 var cognicodeAdminRouter = require('./routes/cogniadmin');
 var blogRouter = require('./routes/blog');
+var siteUsersRouter = require('./routes/siteusers');
+var blogEngagementRouter = require('./routes/blogengagement');
 
 const { handleJwtError } = require('./middleware/auth');
 const socket = require('./socket/index');
@@ -121,7 +144,9 @@ app.use((req, res, next) => {
 // SOCKET.IO
 // ======================================================
 
-var io = new Server(server, { cors: { origin: [ 'https://cognicodeedutech.com', 'https://www.cognicodeedutech.com', 'https://api.cognicodeedutech.com', 'http://localhost:5173', 'http://localhost:5174', 'http://localhost:4000', "https://ccitpms.com" ], methods: ['GET', 'POST'], credentials: true } });
+var io = new Server(server, { cors: { origin: [ 'https://cognicodeedutech.com', 'https://www.cognicodeedutech.com', 'https://api.cognicodeedutech.com', 'http://localhost:5173', 'http://localhost:5174', 'http://localhost:4000', 'http://127.0.0.1:4000', 'http://127.0.0.1:5173', "https://ccitpms.com" ], methods: ['GET', 'POST'], credentials: true } });
+const { setBlogIo } = require('./routes/blog-realtime');
+setBlogIo(io);
 
 // ======================================================
 // WEB PUSH
@@ -210,6 +235,9 @@ app.use('/teamleader', teamLeaderRouter);
 app.use('/clientrequests', clientRequestsRouter);
 app.use('/cogniadmin', cognicodeAdminRouter);
 app.use('/blog', blogRouter);
+app.use('/site-users', siteUsersRouter);
+app.use('/blog-engagement', blogEngagementRouter);
+console.log('✅ Site user routes mounted at /site-users (send-otp, login, register)');
 
 
 
@@ -259,7 +287,11 @@ app.use((err, req, res, next) => {
 // SOCKET INIT
 // ======================================================
 
-socket(io);
+try {
+  socket(io);
+} catch (err) {
+  console.error('❌ Socket init failed (continuing without realtime):', err.message);
+}
 
 
 // ======================================================

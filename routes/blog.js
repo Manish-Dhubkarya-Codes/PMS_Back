@@ -10,6 +10,44 @@ const fs = require("fs");
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
 const cognicodePool = require("./CognicodePool");
+const nodemailer = require("nodemailer");
+const { optionalSiteUser, optionalAdmin } = require("./site-helpers");
+
+const subscriberMailer = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+async function notifyBlogSubscribers(post) {
+  try {
+    const result = await cognicodePool.query(
+      `SELECT email FROM blog_subscribers WHERE is_active = TRUE LIMIT 500`
+    );
+    const emails = result.rows.map((row) => row.email).filter(Boolean);
+    if (!emails.length) return;
+    const href = `https://cognicodeedutech.com/blog/article/?slug=${encodeURIComponent(post.slug)}`;
+    const html = `
+      <div style="font-family: Arial, sans-serif; max-width: 640px; margin: auto; padding: 24px;">
+        <h2 style="color:#78025F; margin-bottom: 8px;">New from CogniCode</h2>
+        <h3 style="margin: 0 0 12px;">${post.title}</h3>
+        <p style="color:#444; line-height:1.6;">${post.excerpt || "A new research guide is live."}</p>
+        <p><a href="${href}" style="background:#78025F;color:#fff;padding:10px 16px;border-radius:999px;text-decoration:none;">Read the post</a></p>
+        <p style="color:#888;font-size:12px;margin-top:24px;">You receive this because you followed CogniCode on the blog.</p>
+      </div>
+    `;
+    await subscriberMailer.sendMail({
+      from: `"CogniCode EduTech" <${process.env.SENDER_EMAIL || process.env.SMTP_USER}>`,
+      bcc: emails.join(","),
+      subject: `New CogniCode post: ${post.title}`,
+      html,
+    });
+  } catch (err) {
+    console.warn("Subscriber notify skipped:", err.message);
+  }
+}
 
 // ======================================================
 // STORAGE
@@ -566,10 +604,78 @@ router.post("/subscribe", async (req, res) => {
     res.json({
       success: true,
       message: "Subscribed successfully",
+      following: true,
     });
   } catch (error) {
     console.error("POST /blog/subscribe error:", error);
     res.status(500).json({ success: false, message: "Subscription failed" });
+  }
+});
+
+router.post("/follow", async (req, res) => {
+  try {
+    let email = String(req.body?.email || "").trim().toLowerCase();
+    let name = String(req.body?.name || "").trim().slice(0, 120);
+    const source = String(req.body?.source || "follow").slice(0, 120);
+    let userId = null;
+
+    const me = await optionalSiteUser(req);
+    const admin = await optionalAdmin(req);
+    if (me.user) {
+      email = me.user.email || email;
+      name = name || me.user.displayName || me.user.username || "";
+      userId = me.user.userId;
+    } else if (admin.admin) {
+      email = admin.admin.email || email;
+      name = name || admin.admin.name || "Admin";
+    }
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        success: false,
+        needsEmail: true,
+        message: "Enter an email to follow and get updates",
+      });
+    }
+
+    await cognicodePool.query(
+      `INSERT INTO blog_subscribers (email, source, "userId", name, is_active)
+       VALUES ($1, $2, $3, $4, TRUE)
+       ON CONFLICT (email) DO UPDATE SET
+         is_active = TRUE,
+         source = EXCLUDED.source,
+         "userId" = COALESCE(EXCLUDED."userId", blog_subscribers."userId"),
+         name = COALESCE(EXCLUDED.name, blog_subscribers.name)`,
+      [email, source, userId, name || null]
+    );
+
+    return res.json({
+      success: true,
+      following: true,
+      email,
+      message: "You’re following CogniCode. We’ll email future blog and company updates.",
+    });
+  } catch (error) {
+    console.error("POST /blog/follow error:", error);
+    return res.status(500).json({ success: false, message: "Could not follow right now" });
+  }
+});
+
+router.get("/follow/status", async (req, res) => {
+  try {
+    let email = String(req.query.email || "").trim().toLowerCase();
+    const me = await optionalSiteUser(req);
+    const admin = await optionalAdmin(req);
+    if (me.user?.email) email = me.user.email;
+    else if (admin.admin?.email) email = String(admin.admin.email).toLowerCase();
+    if (!email) return res.json({ success: true, following: false });
+    const found = await cognicodePool.query(
+      `SELECT 1 FROM blog_subscribers WHERE email = $1 AND is_active = TRUE LIMIT 1`,
+      [email]
+    );
+    return res.json({ success: true, following: found.rows.length > 0, email });
+  } catch (error) {
+    return res.json({ success: true, following: false });
   }
 });
 
@@ -674,10 +780,19 @@ router.post("/admin/posts", verifyAdmin, async (req, res) => {
       ]
     );
 
+    const created = mapPostRow(result.rows[0]);
+    if (status === "published") {
+      notifyBlogSubscribers({
+        title: created.title,
+        excerpt: created.excerpt,
+        slug: created.slug,
+      });
+    }
+
     res.status(201).json({
       success: true,
       message: "Post created",
-      data: mapPostRow(result.rows[0]),
+      data: created,
     });
   } catch (error) {
     console.error("POST /blog/admin/posts error:", error);

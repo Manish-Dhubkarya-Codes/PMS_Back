@@ -1644,6 +1644,27 @@ socket.on("deleteHeadMessage", async (data) => {
   }
 });
 
+    socket.on("joinSiteUser", (userId) => {
+      const id = Number(userId);
+      if (id) socket.join(`site_user_${id}`);
+    });
+    socket.on("leaveSiteUser", (userId) => {
+      const id = Number(userId);
+      if (id) socket.leave(`site_user_${id}`);
+    });
+
+    socket.on("joinBlogFeed", () => {
+      socket.join("blog_feed");
+    });
+    socket.on("joinBlogPost", (slug) => {
+      const clean = String(slug || "").trim();
+      if (clean) socket.join(`blog_${clean}`);
+    });
+    socket.on("leaveBlogPost", (slug) => {
+      const clean = String(slug || "").trim();
+      if (clean) socket.leave(`blog_${clean}`);
+    });
+
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
     });
