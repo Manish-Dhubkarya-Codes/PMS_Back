@@ -119,11 +119,19 @@ router.post('/edit_client', verifyToken, async function (req, res) {
 
 router.get('/fetch_all_clients', verifyToken, async function (req, res) {
   try {
-    const query = `
-      SELECT key_id, name, email, mobile
-      FROM "Entities"."ClientSecureKey"
-    `;
-    const result = await pgPool.query(query);
+    let result;
+    try {
+      result = await pgPool.query(`
+        SELECT key_id, name, email, mobile, created_at
+        FROM "Entities"."ClientSecureKey"
+        ORDER BY created_at DESC NULLS LAST
+      `);
+    } catch {
+      result = await pgPool.query(`
+        SELECT key_id, name, email, mobile
+        FROM "Entities"."ClientSecureKey"
+      `);
+    }
     return res.status(200).json({
       status: true,
       data: result.rows,

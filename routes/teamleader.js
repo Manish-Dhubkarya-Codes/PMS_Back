@@ -40,10 +40,19 @@ router.post('/save_teamleader_key', async function (req, res) {
 router.get('/fetch_all_teamleaders', async function (req, res) {
   try {
     const query = `
-      SELECT key_id, name, email, mobile
+      SELECT key_id, name, email, mobile, created_at
       FROM "Entities"."TeamLeaderSecureKey"
+      ORDER BY created_at DESC NULLS LAST
     `;
-    const result = await pgPool.query(query);
+    let result;
+    try {
+      result = await pgPool.query(query);
+    } catch {
+      result = await pgPool.query(`
+        SELECT key_id, name, email, mobile
+        FROM "Entities"."TeamLeaderSecureKey"
+      `);
+    }
     return res.status(200).json({
       status: true,
       data: result.rows,

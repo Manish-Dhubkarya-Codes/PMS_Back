@@ -33,6 +33,11 @@ const initializeDatabase1 = async () => {
         "mobile" VARCHAR(15)
       );
 
+      ALTER TABLE "Entities"."TeamLeaderSecureKey"
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+      ALTER TABLE "Entities"."ClientSecureKey"
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
 CREATE TABLE IF NOT EXISTS "Entities"."clients" (
   "clientId" SERIAL PRIMARY KEY,
   "clientName" VARCHAR(100) NOT NULL,

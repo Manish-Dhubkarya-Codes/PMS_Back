@@ -181,7 +181,7 @@ router.post('/verify_employee_otp', async function (req, res) {
         "employeeName", "employeeMail", "employmentID", "gender", "employeeDesignation",
         "password", "role", "securityKey", "employeePic", "status"
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
-      RETURNING id
+      RETURNING id, created_at
     `;
 
     const values = [
@@ -209,7 +209,8 @@ if (io) {
     employeeDesignation: data.employeeDesignation,
     gender: data.gender,
     role: data.role,
-    status: 'pending'
+    status: 'pending',
+    created_at: result.rows[0].created_at
   });
 }
 
@@ -230,14 +231,9 @@ router.get('/fetch_all_registrations', verifyToken,async function (req, res) {
   try {
     const query = `
       SELECT id, "employeeName", "employeeMail", "employmentID", "employeeDesignation",
-             gender, role, "securityKey", "employeePic", status
+             gender, role, "securityKey", "employeePic", status, created_at
       FROM "Entities"."employeeRegRequest"
-      ORDER BY CASE
-        WHEN status = 'pending' THEN 1
-        WHEN status = 'accepted' THEN 2
-        WHEN status = 'rejected' THEN 3
-        ELSE 4
-      END
+      ORDER BY created_at DESC NULLS LAST, id DESC
     `;
     const result = await pgPool.query(query);
 
@@ -253,7 +249,8 @@ router.get('/fetch_all_registrations', verifyToken,async function (req, res) {
         role: row.role,
         securityKey: row.securityKey,
         employeePic: row.employeePic,
-        status: row.status
+        status: row.status,
+        created_at: row.created_at
       }))
     });
   } catch (error) {
