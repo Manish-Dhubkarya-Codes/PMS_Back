@@ -157,6 +157,9 @@ const initializeDatabase2 = async () => {
   "active_date" TIMESTAMP DEFAULT NULL
 );
 
+      ALTER TABLE projectschema.clientproject
+        ADD COLUMN IF NOT EXISTS "active_date" TIMESTAMP DEFAULT NULL;
+
 CREATE TABLE IF NOT EXISTS projectschema."progressTracking" (
       project_id INTEGER PRIMARY KEY REFERENCES projectschema.clientproject(project_id) ON DELETE CASCADE,
       progress JSONB NOT NULL DEFAULT '{"start": "no", "payment": "0%", "work": "0%"}'::jsonb,

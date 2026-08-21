@@ -438,6 +438,8 @@ router.post("/submit_request", async function (req, res) {
         cp.title,
         cp.deadline::TEXT,
         cp.description,
+        cp.status AS project_status,
+        cp.active_date,
         c."clientName",
         e."employeeName",
         e."employeeDesignation",
@@ -506,6 +508,8 @@ router.get("/employee_requests", async function (req, res) {
         cp.title,
         cp.deadline::TEXT,
         cp.description,
+        cp.status AS project_status,
+        cp.active_date,
         c."clientName",
         e."employeeName",
         e."employeeDesignation",
@@ -597,6 +601,8 @@ router.get("/project_request_status/:employeeId", async function (req, res) {
         cp.title,
         cp.deadline::TEXT,
         cp.description,
+        cp.status AS project_status,
+        cp.active_date,
         c."clientName"
       FROM projectschema."employeeRequests" er
       JOIN projectschema.clientproject cp ON er.project_id = cp.project_id
@@ -1735,11 +1741,11 @@ router.post("/update_project_status/:projectId", async (req, res) => {
         seen_by: []
       });
 
-      query += `, active_date = NOW(), clientchats = array_append(COALESCE(clientchats, ARRAY[]::text[]), $3)`;
+      query += `, active_date = COALESCE(active_date, NOW()), clientchats = array_append(COALESCE(clientchats, ARRAY[]::text[]), $3)`;
       values = [status, projectId, activationMsg];
     }
 
-    query += ` WHERE project_id = $2 RETURNING status, active_date`;
+    query += ` WHERE project_id = $2 RETURNING status, active_date, clientid`;
 
     const result = await pgPool.query(query, values);
 
@@ -1759,6 +1765,10 @@ router.post("/update_project_status/:projectId", async (req, res) => {
       io.to("tl").emit("projectStatusUpdated", statusPayload);
       io.to("head").emit("projectStatusUpdated", statusPayload);
       io.to(`project_${projectId}`).emit("projectStatusUpdated", statusPayload);
+      const clientId = result.rows[0]?.clientid;
+      if (clientId) {
+        io.to(`client_${clientId}`).emit("projectStatusUpdated", statusPayload);
+      }
       // Legacy alias still used by some landing pages
       io.to("employees").emit("projectStatusUpdate", statusPayload);
       io.to("tl").emit("projectStatusUpdate", statusPayload);
