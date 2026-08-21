@@ -77,7 +77,16 @@ const ALLOWED_MIME = new Set([
   "application/vnd.ms-excel",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/zip",
+  "application/x-zip-compressed",
   "text/plain",
+  "text/csv",
+  "text/markdown",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/wav",
+  "audio/webm",
 ]);
 
 const storage = multer.diskStorage({
@@ -88,17 +97,43 @@ const storage = multer.diskStorage({
   },
 });
 
+const ALLOWED_EXT = new Set([
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".webp",
+  ".gif",
+  ".svg",
+  ".mp4",
+  ".webm",
+  ".mov",
+  ".pdf",
+  ".doc",
+  ".docx",
+  ".xls",
+  ".xlsx",
+  ".ppt",
+  ".pptx",
+  ".zip",
+  ".txt",
+  ".csv",
+  ".md",
+  ".mp3",
+  ".wav",
+]);
+
 const upload = multer({
   storage,
   limits: {
     fileSize: 80 * 1024 * 1024, // 80MB for video assets
-    files: 10,
+    files: 16,
   },
   fileFilter: (_req, file, cb) => {
-    if (ALLOWED_MIME.has(file.mimetype)) {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (ALLOWED_MIME.has(file.mimetype) || ALLOWED_EXT.has(ext)) {
       cb(null, true);
     } else {
-      cb(new Error(`File type not allowed: ${file.mimetype}`));
+      cb(new Error(`File type not allowed: ${file.mimetype || ext || "unknown"}`));
     }
   },
 });
@@ -241,11 +276,16 @@ async function initializeBlogDB() {
       )`
     );
 
-    // Additive columns for DBs created before social fields existed
+    // Additive columns for DBs created before social / structured-article fields existed
     const alters = [
       ["youtube_url", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS youtube_url TEXT"],
       ["media_gallery", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS media_gallery JSONB DEFAULT '[]'::jsonb"],
       ["likes", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS likes INTEGER DEFAULT 0"],
+      ["post_type", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS post_type VARCHAR(40) DEFAULT 'article'"],
+      ["tags", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'::jsonb"],
+      ["difficulty", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS difficulty VARCHAR(40)"],
+      ["subtitle", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS subtitle TEXT"],
+      ["attachments", "ALTER TABLE blog_posts ADD COLUMN IF NOT EXISTS attachments JSONB DEFAULT '[]'::jsonb"],
     ];
     for (const [label, sql] of alters) {
       try {
@@ -261,7 +301,8 @@ async function initializeBlogDB() {
       `CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
        CREATE INDEX IF NOT EXISTS idx_blog_posts_category ON blog_posts(category_slug);
        CREATE INDEX IF NOT EXISTS idx_blog_posts_featured ON blog_posts(featured);
-       CREATE INDEX IF NOT EXISTS idx_blog_media_type ON blog_media(media_type)`
+       CREATE INDEX IF NOT EXISTS idx_blog_media_type ON blog_media(media_type);
+       CREATE INDEX IF NOT EXISTS idx_blog_posts_type ON blog_posts(post_type)`
     );
 
     // Also ensure admindetails exists on Cognicode DB (login for website admin)
@@ -326,17 +367,76 @@ function publicFileUrl(filename) {
 function detectMediaType(mime = "") {
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
   if (
     mime.includes("pdf") ||
     mime.includes("word") ||
     mime.includes("sheet") ||
     mime.includes("excel") ||
+    mime.includes("powerpoint") ||
+    mime.includes("presentation") ||
     mime.includes("zip") ||
-    mime.includes("text")
+    mime.includes("text") ||
+    mime.includes("csv") ||
+    mime.includes("markdown")
   ) {
     return "document";
   }
   return "file";
+}
+
+const ALLOWED_POST_TYPES = new Set([
+  "article",
+  "tutorial",
+  "how-to",
+  "listicle",
+  "news",
+  "comparison",
+  "video",
+  "resource",
+  "faq",
+  "case-study",
+]);
+
+function normalizePostType(value) {
+  const type = String(value || "article")
+    .toLowerCase()
+    .trim();
+  return ALLOWED_POST_TYPES.has(type) ? type : "article";
+}
+
+function normalizeTags(value) {
+  if (Array.isArray(value)) {
+    return [...new Set(value.map((t) => String(t || "").trim()).filter(Boolean))].slice(
+      0,
+      16
+    );
+  }
+  if (typeof value === "string" && value.trim()) {
+    return [
+      ...new Set(
+        value
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean)
+      ),
+    ].slice(0, 16);
+  }
+  return [];
+}
+
+function normalizeAttachments(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => ({
+      title: String(item?.title || item?.name || "Download").slice(0, 180),
+      description: String(item?.description || "").slice(0, 400),
+      url: String(item?.url || ""),
+      fileLabel: String(item?.fileLabel || item?.label || "Download"),
+      fileType: String(item?.fileType || item?.type || "file"),
+    }))
+    .filter((item) => item.url)
+    .slice(0, 20);
 }
 
 function slugify(text = "") {
@@ -401,11 +501,16 @@ function mapPostRow(row) {
     id: row.id,
     slug: row.slug,
     title: row.title,
+    subtitle: row.subtitle || "",
     excerpt: row.excerpt,
     metaDescription: row.meta_description,
     content: row.content,
     keyTakeaways: row.key_takeaways,
     categorySlug: row.category_slug,
+    postType: normalizePostType(row.post_type),
+    tags: Array.isArray(row.tags) ? row.tags : [],
+    difficulty: row.difficulty || "",
+    attachments: Array.isArray(row.attachments) ? row.attachments : [],
     author: {
       name: row.author_name,
       role: row.author_role,
@@ -445,11 +550,14 @@ router.get("/", (_req, res) => {
         "GET /blog/posts",
         "GET /blog/posts/:slug",
         "GET /blog/categories",
+        "GET /blog/types",
+        "GET /blog/tags",
         "GET /blog/resources",
         "POST /blog/subscribe",
       ],
       admin: [
         "POST /blog/admin/posts",
+        "GET /blog/admin/posts/:id",
         "PUT /blog/admin/posts/:id",
         "DELETE /blog/admin/posts/:id",
         "POST /blog/admin/upload",
@@ -469,6 +577,8 @@ router.get("/posts", async (req, res) => {
       category,
       search,
       featured,
+      type,
+      tag,
       page = 1,
       limit = 12,
       status = "published",
@@ -490,12 +600,20 @@ router.get("/posts", async (req, res) => {
       where.push(`category_slug = $${i++}`);
       values.push(category);
     }
+    if (type && type !== "all") {
+      where.push(`post_type = $${i++}`);
+      values.push(normalizePostType(type));
+    }
+    if (tag && String(tag).trim() && tag !== "all") {
+      where.push(`tags @> $${i++}::jsonb`);
+      values.push(JSON.stringify([String(tag).trim()]));
+    }
     if (featured === "true" || featured === "1") {
       where.push(`featured = TRUE`);
     }
     if (search && String(search).trim()) {
       where.push(
-        `(title ILIKE $${i} OR excerpt ILIKE $${i} OR meta_description ILIKE $${i} OR author_name ILIKE $${i})`
+        `(title ILIKE $${i} OR excerpt ILIKE $${i} OR meta_description ILIKE $${i} OR author_name ILIKE $${i} OR COALESCE(subtitle,'') ILIKE $${i} OR COALESCE(tags::text,'') ILIKE $${i} OR COALESCE(keywords::text,'') ILIKE $${i})`
       );
       values.push(`%${String(search).trim()}%`);
       i++;
@@ -564,6 +682,44 @@ router.get("/categories", async (_req, res) => {
   } catch (error) {
     console.error("GET /blog/categories error:", error);
     res.status(500).json({ success: false, message: "Failed to fetch categories" });
+  }
+});
+
+// Post formats / types with published counts
+router.get("/types", async (_req, res) => {
+  try {
+    const result = await cognicodePool.query(
+      `SELECT COALESCE(NULLIF(post_type, ''), 'article') AS slug,
+              COUNT(*)::int AS post_count
+       FROM blog_posts
+       WHERE status = 'published'
+       GROUP BY 1
+       ORDER BY post_count DESC, slug ASC`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error("GET /blog/types error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch post types" });
+  }
+});
+
+// Tags with published counts
+router.get("/tags", async (_req, res) => {
+  try {
+    const result = await cognicodePool.query(
+      `SELECT LOWER(TRIM(tag)) AS slug,
+              COUNT(*)::int AS post_count
+       FROM blog_posts,
+            LATERAL jsonb_array_elements_text(COALESCE(tags, '[]'::jsonb)) AS tag
+       WHERE status = 'published' AND TRIM(tag) <> ''
+       GROUP BY 1
+       ORDER BY post_count DESC, slug ASC
+       LIMIT 80`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error("GET /blog/tags error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch tags" });
   }
 });
 
@@ -703,10 +859,15 @@ router.post("/admin/posts", verifyAdmin, async (req, res) => {
       title,
       slug: rawSlug,
       excerpt,
+      subtitle,
       metaDescription,
       content,
       keyTakeaways,
       categorySlug,
+      postType,
+      tags,
+      difficulty,
+      attachments,
       authorName,
       authorRole,
       authorBio,
@@ -741,13 +902,13 @@ router.post("/admin/posts", verifyAdmin, async (req, res) => {
         category_slug, author_name, author_role, author_bio, author_initials,
         cover_image, cover_video, youtube_url, media_gallery, image_label, image_gradient, keywords,
         read_time, status, featured, resource, service_cta, published_at,
-        created_by, updated_by
+        created_by, updated_by, post_type, tags, difficulty, subtitle, attachments
       ) VALUES (
         $1,$2,$3,$4,$5::jsonb,$6::jsonb,
         $7,$8,$9,$10,$11,
         $12,$13,$14,$15::jsonb,$16,$17,$18::jsonb,
         $19,$20,$21,$22::jsonb,$23::jsonb,$24,
-        $25,$25
+        $25,$25,$26,$27::jsonb,$28,$29,$30::jsonb
       ) RETURNING *`,
       [
         slug,
@@ -777,6 +938,11 @@ router.post("/admin/posts", verifyAdmin, async (req, res) => {
           ? publishedAt || new Date().toISOString()
           : publishedAt || null,
         req.admin.adminId,
+        normalizePostType(postType),
+        JSON.stringify(normalizeTags(tags)),
+        difficulty ? String(difficulty).slice(0, 40) : null,
+        subtitle ? String(subtitle).slice(0, 320) : null,
+        JSON.stringify(normalizeAttachments(attachments)),
       ]
     );
 
@@ -802,6 +968,27 @@ router.post("/admin/posts", verifyAdmin, async (req, res) => {
         .json({ success: false, message: "Slug already exists" });
     }
     res.status(500).json({ success: false, message: "Failed to create post" });
+  }
+});
+
+// Single post for editor (drafts included)
+router.get("/admin/posts/:id", verifyAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) {
+      return res.status(400).json({ success: false, message: "Invalid post id" });
+    }
+    const result = await cognicodePool.query(
+      `SELECT * FROM blog_posts WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Post not found" });
+    }
+    res.json({ success: true, data: mapPostRow(result.rows[0]) });
+  } catch (error) {
+    console.error("GET /blog/admin/posts/:id error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch post" });
   }
 });
 
@@ -857,7 +1044,12 @@ router.put("/admin/posts/:id", verifyAdmin, async (req, res) => {
         service_cta = $23::jsonb,
         published_at = $24,
         updated_by = $25,
-        updated_at = CURRENT_TIMESTAMP
+        updated_at = CURRENT_TIMESTAMP,
+        post_type = $27,
+        tags = $28::jsonb,
+        difficulty = $29,
+        subtitle = $30,
+        attachments = $31::jsonb
       WHERE id = $26
       RETURNING *`,
       [
@@ -903,6 +1095,27 @@ router.put("/admin/posts/:id", verifyAdmin, async (req, res) => {
         nextPublishedAt,
         req.admin.adminId,
         id,
+        b.postType !== undefined
+          ? normalizePostType(b.postType)
+          : normalizePostType(current.post_type),
+        JSON.stringify(
+          b.tags !== undefined ? normalizeTags(b.tags) : current.tags || []
+        ),
+        b.difficulty !== undefined
+          ? b.difficulty
+            ? String(b.difficulty).slice(0, 40)
+            : null
+          : current.difficulty,
+        b.subtitle !== undefined
+          ? b.subtitle
+            ? String(b.subtitle).slice(0, 320)
+            : null
+          : current.subtitle,
+        JSON.stringify(
+          b.attachments !== undefined
+            ? normalizeAttachments(b.attachments)
+            : current.attachments || []
+        ),
       ]
     );
 
