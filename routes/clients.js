@@ -124,12 +124,13 @@ router.get('/fetch_all_clients', verifyToken, async function (req, res) {
       result = await pgPool.query(`
         SELECT key_id, name, email, mobile, created_at
         FROM "Entities"."ClientSecureKey"
-        ORDER BY created_at DESC NULLS LAST
+        ORDER BY created_at DESC NULLS LAST, key_id DESC
       `);
     } catch {
       result = await pgPool.query(`
         SELECT key_id, name, email, mobile
         FROM "Entities"."ClientSecureKey"
+        ORDER BY key_id DESC
       `);
     }
     return res.status(200).json({

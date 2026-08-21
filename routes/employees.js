@@ -14,7 +14,7 @@ const nodemailer = require('nodemailer');
 // Create transporter
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
-  port: process.env.SMTP_PORT,
+  port: Number(process.env.SMTP_PORT) || 587,
   secure: process.env.SMTP_SECURE === 'true', // true for 465, false for other ports
   auth: {
     user: process.env.SMTP_USER,
@@ -24,6 +24,21 @@ const transporter = nodemailer.createTransport({
 
 // In-memory store for pending registrations (unchanged)
 const pendingEmployees = new Map();
+const pendingPasswordResets = new Map();
+
+function getPendingPasswordReset(email) {
+  if (!email) return { key: email, pending: undefined };
+  if (pendingPasswordResets.has(email)) {
+    return { key: email, pending: pendingPasswordResets.get(email) };
+  }
+  const lower = String(email).trim().toLowerCase();
+  for (const [key, value] of pendingPasswordResets.entries()) {
+    if (String(key).toLowerCase() === lower) {
+      return { key, pending: value };
+    }
+  }
+  return { key: email, pending: undefined };
+}
 
 const sendProfessionalOTPEmail = async (email, otp, userType = "User", purpose = "registration") => {
   const action = purpose === "password_reset" ? "password reset" : "registration";
@@ -46,7 +61,7 @@ const sendProfessionalOTPEmail = async (email, otp, userType = "User", purpose =
   `;
 
   await transporter.sendMail({
-    from: process.env.SENDER_EMAIL,
+    from: `"CogniCode" <${process.env.SENDER_EMAIL || process.env.SMTP_USER}>`,
     to: email,
     subject: `Your ${userType} ${subjectAction} OTP - CogniCode`,
     html
@@ -308,7 +323,7 @@ router.post('/admin/accept_employee_request/:requestId', verifyToken, async func
 
     const io = req.app.get('io');  // Access io from the app
     if (io) {
-      io.to('head').emit('employeeRegUpdate', {
+      io.to('head').to('tl').emit('employeeRegUpdate', {
         id: requestId.toString(),
         status: 'accepted'
       });
@@ -389,7 +404,7 @@ router.post('/admin/reject_employee_request/:requestId', verifyToken, async func
     // New: Emit socket update to head room
     const io = req.app.get('io');
     if (io) {
-      io.to('head').emit('employeeRegUpdate', {
+      io.to('head').to('tl').emit('employeeRegUpdate', {
         id: requestId.toString(),
         status: 'rejected'
       });
@@ -865,68 +880,76 @@ router.post('/request_password_reset', async function (req, res) {
   try {
     // Search only by email (safe & simple)
     const query = `
-      SELECT "employeeId", "employeeMail", role 
-      FROM "Entities".employees 
-      WHERE "employeeMail" = $1 AND role = $2
+      SELECT "employeeId", "employeeMail", "role"
+      FROM "Entities".employees
+      WHERE LOWER("employeeMail") = LOWER($1) AND "role" = $2
     `;
-    const result = await pgPool.query(query, [email, role]);
+    const result = await pgPool.query(query, [email.trim(), role]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ status: false, message: "No account found with this email." });
     }
 
+    const sentTo = result.rows[0].employeeMail;
+
     // Rate limit
-    const pending = pendingPasswordResets.get(email);
+    const { pending } = getPendingPasswordReset(sentTo);
     if (pending && Date.now() - pending.timestamp < 60000) {
       return res.status(429).json({ status: false, message: "Please wait 1 minute before requesting again." });
     }
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    pendingPasswordResets.set(email, {
+    pendingPasswordResets.set(sentTo, {
       otp,
       timestamp: Date.now(),
       role,
       verified: false
     });
 
-    await sendProfessionalOTPEmail(email, otp, `${role} Password Reset`, "password_reset");
+    try {
+      await sendProfessionalOTPEmail(sentTo, otp, `${role} Password Reset`, "password_reset");
+    } catch (mailErr) {
+      pendingPasswordResets.delete(sentTo);
+      console.error("Password reset OTP email failed:", mailErr);
+      return res.status(500).json({ status: false, message: "Failed to send OTP email. Please try again." });
+    }
 
     return res.status(200).json({
       status: true,
       message: "OTP sent to your email.",
-      sentTo: email
+      sentTo
     });
   } catch (e) {
-    console.error(e);
+    console.error("Employee password reset request error:", e);
     return res.status(500).json({ status: false, message: "Server error." });
   }
 });
 
 router.post('/verify_reset_otp', async function (req, res) {
   const { email, otp, role } = req.body;
-  const pending = pendingPasswordResets.get(email);
+  const { key, pending } = getPendingPasswordReset(email);
   if (!pending || pending.role !== role || pending.otp !== otp || Date.now() - pending.timestamp > 600000) {
     return res.status(400).json({ status: false, message: "Invalid or expired OTP." });
   }
   pending.verified = true;
-  pendingPasswordResets.set(email, pending);
+  pendingPasswordResets.set(key, pending);
   return res.status(200).json({ status: true, message: "OTP verified." });
 });
 
 router.post('/reset_password', async function (req, res) {
   const { email, newPassword, role } = req.body;
-  const pending = pendingPasswordResets.get(email);
+  const { key, pending } = getPendingPasswordReset(email);
   if (!pending || !pending.verified || pending.role !== role) {
     return res.status(400).json({ status: false, message: "Session expired. Please restart forgot password." });
   }
   try {
     const hashed = await bcrypt.hash(newPassword, 10);
     const result = await pgPool.query(
-      `UPDATE "Entities".employees SET password = $1 WHERE ("employeeMail" = $2 OR "employeeName" = $2) AND role = $3`,
+      `UPDATE "Entities".employees SET password = $1 WHERE (LOWER("employeeMail") = LOWER($2) OR "employeeName" = $2) AND "role" = $3`,
       [hashed, email, role]
     );
     if (result.rowCount === 0) return res.status(404).json({ status: false, message: "User not found." });
-    pendingPasswordResets.delete(email);
+    pendingPasswordResets.delete(key);
     return res.status(200).json({ status: true, message: "Password reset successfully!" });
   } catch (e) {
     return res.status(500).json({ status: false, message: "Failed to reset password." });
