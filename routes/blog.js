@@ -57,6 +57,11 @@ const blogUploadDir = path.join(__dirname, "../public/files/blog");
 if (!fs.existsSync(blogUploadDir)) {
   fs.mkdirSync(blogUploadDir, { recursive: true });
 }
+const resumeDir = path.join(blogUploadDir, "_resume");
+if (!fs.existsSync(resumeDir)) {
+  fs.mkdirSync(resumeDir, { recursive: true });
+}
+const RESUME_CHUNK_SIZE = 256 * 1024;
 
 const ALLOWED_MIME = new Set([
   // images
@@ -561,6 +566,10 @@ router.get("/", (_req, res) => {
         "PUT /blog/admin/posts/:id",
         "DELETE /blog/admin/posts/:id",
         "POST /blog/admin/upload",
+        "POST /blog/admin/upload/init",
+        "POST /blog/admin/upload/chunk",
+        "POST /blog/admin/upload/complete",
+        "GET /blog/admin/upload/session/:uploadId",
         "POST /blog/admin/upload-multiple",
         "GET /blog/admin/media",
         "DELETE /blog/admin/media/:id",
@@ -896,6 +905,20 @@ router.post("/admin/posts", verifyAdmin, async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid slug" });
     }
 
+    if (categorySlug) {
+      const cat = await cognicodePool.query(
+        `SELECT slug FROM blog_categories WHERE slug = $1 LIMIT 1`,
+        [categorySlug]
+      );
+      if (cat.rows.length === 0) {
+        await cognicodePool.query(
+          `INSERT INTO blog_categories (name, slug, description)
+           VALUES ($1,$2,$3) ON CONFLICT (slug) DO NOTHING`,
+          [categorySlug.replace(/-/g, " "), categorySlug, ""]
+        );
+      }
+    }
+
     const result = await cognicodePool.query(
       `INSERT INTO blog_posts (
         slug, title, excerpt, meta_description, content, key_takeaways,
@@ -965,9 +988,25 @@ router.post("/admin/posts", verifyAdmin, async (req, res) => {
     if (error.code === "23505") {
       return res
         .status(409)
-        .json({ success: false, message: "Slug already exists" });
+        .json({ success: false, message: "Slug already exists. Change the slug and try again." });
     }
-    res.status(500).json({ success: false, message: "Failed to create post" });
+    if (error.code === "23503") {
+      return res.status(400).json({
+        success: false,
+        message: "That category is not in the database. Click Init DB tables, then publish again.",
+      });
+    }
+    if (error.code === "42703") {
+      return res.status(500).json({
+        success: false,
+        message: "Blog table is missing a column. Click Init DB tables, then publish again.",
+        detail: error.message,
+      });
+    }
+    res.status(500).json({
+      success: false,
+      message: error.detail || error.message || "Failed to create post",
+    });
   }
 });
 
@@ -1223,6 +1262,220 @@ router.post(
     }
   }
 );
+
+const chunkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (ALLOWED_MIME.has(file.mimetype) || ALLOWED_EXT.has(ext) || ext) {
+      cb(null, true);
+    } else {
+      cb(new Error(`File type not allowed: ${file.mimetype || ext || "unknown"}`));
+    }
+  },
+});
+
+function resumeMetaPath(uploadId) {
+  return path.join(resumeDir, `${uploadId}.json`);
+}
+function resumePartPath(uploadId) {
+  return path.join(resumeDir, `${uploadId}.part`);
+}
+function readResumeMeta(uploadId) {
+  const metaFile = resumeMetaPath(uploadId);
+  if (!fs.existsSync(metaFile)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(metaFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function writeResumeMeta(meta) {
+  fs.writeFileSync(resumeMetaPath(meta.uploadId), JSON.stringify(meta));
+}
+function deleteResumeSession(uploadId) {
+  for (const filePath of [resumeMetaPath(uploadId), resumePartPath(uploadId)]) {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  }
+}
+
+router.post("/admin/upload/init", verifyAdmin, async (req, res) => {
+  try {
+    const originalName = String(req.body?.originalName || req.body?.filename || "upload").slice(0, 220);
+    const mimeType = String(req.body?.mimeType || req.body?.type || "");
+    const mediaType = req.body?.mediaType || detectMediaType(mimeType);
+    const totalSize = Number(req.body?.totalSize || 0);
+    if (!totalSize || totalSize < 1) {
+      return res.status(400).json({ success: false, message: "totalSize is required" });
+    }
+    const ext = path.extname(originalName || "").toLowerCase();
+    if (mimeType && !ALLOWED_MIME.has(mimeType) && !ALLOWED_EXT.has(ext)) {
+      return res.status(400).json({ success: false, message: `File type not allowed: ${mimeType || ext}` });
+    }
+    const uploadId = uuidv4();
+    const meta = {
+      uploadId,
+      originalName,
+      mimeType,
+      mediaType,
+      totalSize,
+      receivedBytes: 0,
+      adminId: req.admin.adminId,
+      createdAt: new Date().toISOString(),
+    };
+    writeResumeMeta(meta);
+    fs.writeFileSync(resumePartPath(uploadId), Buffer.alloc(0));
+    res.status(201).json({
+      success: true,
+      data: {
+        uploadId,
+        chunkSize: RESUME_CHUNK_SIZE,
+        receivedBytes: 0,
+        totalSize,
+      },
+    });
+  } catch (error) {
+    console.error("POST /blog/admin/upload/init error:", error);
+    res.status(500).json({ success: false, message: "Could not start resumable upload" });
+  }
+});
+
+router.get("/admin/upload/session/:uploadId", verifyAdmin, async (req, res) => {
+  const meta = readResumeMeta(req.params.uploadId);
+  if (!meta) {
+    return res.status(404).json({ success: false, message: "Upload session not found" });
+  }
+  res.json({
+    success: true,
+    data: {
+      uploadId: meta.uploadId,
+      receivedBytes: meta.receivedBytes,
+      totalSize: meta.totalSize,
+      chunkSize: RESUME_CHUNK_SIZE,
+      originalName: meta.originalName,
+    },
+  });
+});
+
+router.post(
+  "/admin/upload/chunk",
+  (req, res, next) => {
+    chunkUpload.single("file")(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({
+          success: false,
+          message: err.message || "Chunk upload failed",
+        });
+      }
+      next();
+    });
+  },
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const uploadId = String(req.body?.uploadId || "");
+      const offset = Number(req.body?.offset || 0);
+      const meta = readResumeMeta(uploadId);
+      if (!meta) {
+        return res.status(404).json({ success: false, message: "Upload session not found" });
+      }
+      if (!req.file?.buffer) {
+        return res.status(400).json({ success: false, message: "No chunk uploaded" });
+      }
+      const chunk = req.file.buffer;
+      if (offset < meta.receivedBytes && offset + chunk.length <= meta.receivedBytes) {
+        return res.json({
+          success: true,
+          message: "Chunk already stored",
+          data: { uploadId, receivedBytes: meta.receivedBytes, totalSize: meta.totalSize },
+        });
+      }
+      if (offset !== meta.receivedBytes) {
+        return res.status(409).json({
+          success: false,
+          message: "Chunk offset does not match received bytes",
+          data: { uploadId, receivedBytes: meta.receivedBytes, expectedOffset: meta.receivedBytes },
+        });
+      }
+      if (meta.receivedBytes + chunk.length > meta.totalSize) {
+        return res.status(400).json({ success: false, message: "Chunk exceeds declared file size" });
+      }
+      fs.appendFileSync(resumePartPath(uploadId), chunk);
+      meta.receivedBytes += chunk.length;
+      writeResumeMeta(meta);
+      res.json({
+        success: true,
+        message: "Chunk stored",
+        data: {
+          uploadId,
+          receivedBytes: meta.receivedBytes,
+          totalSize: meta.totalSize,
+        },
+      });
+    } catch (error) {
+      console.error("POST /blog/admin/upload/chunk error:", error);
+      res.status(500).json({ success: false, message: "Chunk upload failed" });
+    }
+  }
+);
+
+router.post("/admin/upload/complete", verifyAdmin, async (req, res) => {
+  try {
+    const uploadId = String(req.body?.uploadId || "");
+    const meta = readResumeMeta(uploadId);
+    if (!meta) {
+      return res.status(404).json({ success: false, message: "Upload session not found" });
+    }
+    if (meta.receivedBytes !== meta.totalSize) {
+      return res.status(400).json({
+        success: false,
+        message: "File is incomplete",
+        data: { receivedBytes: meta.receivedBytes, totalSize: meta.totalSize },
+      });
+    }
+    const ext = path.extname(meta.originalName || "").toLowerCase() || "";
+    const filename = `${uuidv4()}${ext}`;
+    fs.renameSync(resumePartPath(uploadId), path.join(blogUploadDir, filename));
+    const url = publicFileUrl(filename);
+    const postId = req.body.postId ? Number(req.body.postId) : null;
+    const result = await cognicodePool.query(
+      `INSERT INTO blog_media (
+        filename, original_name, mime_type, media_type, size_bytes,
+        url, alt_text, uploaded_by, post_id
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING *`,
+      [
+        filename,
+        meta.originalName,
+        meta.mimeType || "application/octet-stream",
+        meta.mediaType || detectMediaType(meta.mimeType),
+        meta.totalSize,
+        url,
+        req.body.altText || null,
+        req.admin.adminId,
+        postId,
+      ]
+    );
+    fs.unlinkSync(resumeMetaPath(uploadId));
+    res.status(201).json({
+      success: true,
+      message: "File uploaded",
+      data: {
+        ...result.rows[0],
+        absolutePathHint: url,
+      },
+    });
+  } catch (error) {
+    console.error("POST /blog/admin/upload/complete error:", error);
+    res.status(500).json({ success: false, message: "Could not complete upload" });
+  }
+});
+
+router.delete("/admin/upload/session/:uploadId", verifyAdmin, async (req, res) => {
+  deleteResumeSession(req.params.uploadId);
+  res.json({ success: true, message: "Upload session removed" });
+});
 
 /**
  * Multiple files upload
